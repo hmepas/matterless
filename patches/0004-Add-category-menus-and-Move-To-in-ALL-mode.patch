@@ -1,0 +1,1036 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 3 Nov 2026 13:20:24 +0300
+Subject: [PATCH 04/11] Add category menus and Move To in ALL mode
+
+Each ALL category gets the native three-dots menu: mark as read, mute, rename,
+delete, and sorting with two new options, unread on top and group by team.
+Move To in a channel's menu now lists the ALL categories instead of the team's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../channel_move_to_sub_menu/index.tsx        |  10 +-
+ .../all_teams_category_menu.tsx               | 198 ++++++++++++++++++
+ .../all_teams_list/all_teams_list.scss        |  31 ---
+ .../all_teams_list/all_teams_list.test.tsx    |  91 ++++++--
+ .../sidebar/all_teams_list/all_teams_list.tsx |  79 ++-----
+ .../all_teams_move_to_sub_menu.test.tsx       |  71 +++++++
+ .../all_teams_move_to_sub_menu.tsx            | 109 ++++++++++
+ .../src/selectors/views/all_teams.test.ts     |  56 ++++-
+ .../channels/src/selectors/views/all_teams.ts |  50 +++--
+ webapp/channels/src/utils/all_teams_mode.ts   |  58 +++++
+ 10 files changed, 633 insertions(+), 120 deletions(-)
+ create mode 100644 webapp/channels/src/components/sidebar/all_teams_list/all_teams_category_menu.tsx
+ create mode 100644 webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.test.tsx
+ create mode 100644 webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.tsx
+
+diff --git a/webapp/channels/src/components/channel_move_to_sub_menu/index.tsx b/webapp/channels/src/components/channel_move_to_sub_menu/index.tsx
+index 94cc84d2..12e30c97 100644
+--- a/webapp/channels/src/components/channel_move_to_sub_menu/index.tsx
++++ b/webapp/channels/src/components/channel_move_to_sub_menu/index.tsx
+@@ -28,7 +28,9 @@ import {getCategoriesForCurrentTeam} from 'selectors/views/channel_sidebar';
+ 
+ import EditCategoryModal from 'components/edit_category_modal';
+ import * as Menu from 'components/menu';
++import AllTeamsMoveToSubMenu from 'components/sidebar/all_teams_list/all_teams_move_to_sub_menu';
+ 
++import {useAllTeamsMode} from 'utils/all_teams_mode';
+ import Constants, {ModalIdentifiers} from 'utils/constants';
+ 
+ import type {GlobalState} from 'types/store';
+@@ -195,4 +197,10 @@ const ChannelMoveToSubMenu = (props: Props) => {
+     );
+ };
+ 
+-export default memo(ChannelMoveToSubMenu);
++// PATCH(all-teams): in ALL mode a channel moves between the ALL categories, not the team's.
++const ChannelMoveToSubMenuSwitch = (props: Props) => {
++    const isAllTeams = useAllTeamsMode();
++    return isAllTeams ? <AllTeamsMoveToSubMenu {...props}/> : <ChannelMoveToSubMenu {...props}/>;
++};
++
++export default memo(ChannelMoveToSubMenuSwitch);
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_category_menu.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_category_menu.tsx
+new file mode 100644
+index 00000000..fcf3ac80
+--- /dev/null
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_category_menu.tsx
+@@ -0,0 +1,198 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): the three-dots menu of a category in the ALL pseudo-team, built on the native one.
++
++import React from 'react';
++import {FormattedMessage} from 'react-intl';
++import {useDispatch, useSelector} from 'react-redux';
++
++import {
++    BellOutlineIcon,
++    CheckIcon,
++    ChevronRightIcon,
++    ClockOutlineIcon,
++    FolderPlusOutlineIcon,
++    FormatListBulletedIcon,
++    PencilOutlineIcon,
++    SortAlphabeticalAscendingIcon,
++    TrashCanOutlineIcon,
++} from '@mattermost/compass-icons/components';
++
++import {readMultipleChannels} from 'mattermost-redux/actions/channels';
++import {getCurrentUserId} from 'mattermost-redux/selectors/entities/common';
++
++import {muteChannel, unmuteChannel} from 'actions/channel_actions';
++import type {AllTeamsShownGroup} from 'selectors/views/all_teams';
++
++import * as Menu from 'components/menu';
++import MarkAsReadMenuItem from 'components/sidebar/sidebar_category/sidebar_category_menu/mark_as_read_menu_item';
++import SidebarCategoryGenericMenu from 'components/sidebar/sidebar_category/sidebar_category_menu/sidebar_category_generic_menu';
++
++import {
++    deleteGroup,
++    DM_GROUP_ID,
++    getAllTeamsLayout,
++    isBuiltInGroup,
++    requestNewGroup,
++    setAllTeamsLayout,
++    setGroupOptions,
++    setGroupSorting,
++} from 'utils/all_teams_mode';
++import type {AllTeamsSorting} from 'utils/all_teams_mode';
++
++type Props = {
++    shownGroup: AllTeamsShownGroup;
++    onRename: () => void;
++};
++
++export default function AllTeamsCategoryMenu({shownGroup, onRename}: Props) {
++    const {group, channelIds, unreadIds, isMuted, unreadFirst} = shownGroup;
++    const dispatch = useDispatch();
++    const currentUserId = useSelector(getCurrentUserId);
++
++    const toggleMute = () => {
++        const action = isMuted ? unmuteChannel : muteChannel;
++        channelIds.forEach((channelId) => dispatch(action(currentUserId, channelId)));
++    };
++
++    const sortItem = (sorting: AllTeamsSorting, label: React.JSX.Element) => (
++        <Menu.Item
++            id={`sort-${sorting}-${group.id}`}
++            key={sorting}
++            labels={label}
++            onClick={() => setAllTeamsLayout(setGroupSorting(getAllTeamsLayout(), group.id, sorting))}
++            trailingElements={group.sorting === sorting ? <CheckIcon size={16}/> : null}
++        />
++    );
++
++    const alphaLabel = (
++        <FormattedMessage
++            id='user.settings.sidebar.sortAlpha'
++            defaultMessage='Alphabetically'
++        />
++    );
++    const recencyLabel = (
++        <FormattedMessage
++            id='sidebar.sortedByRecencyLabel'
++            defaultMessage='Recent activity'
++        />
++    );
++    const manualLabel = (
++        <FormattedMessage
++            id='sidebar.sortedManually'
++            defaultMessage='Manually'
++        />
++    );
++
++    const sortIcons = {
++        alpha: <SortAlphabeticalAscendingIcon size={18}/>,
++        recency: <ClockOutlineIcon size={18}/>,
++        manual: <FormatListBulletedIcon size={18}/>,
++    };
++    const sortLabels = {alpha: alphaLabel, recency: recencyLabel, manual: manualLabel};
++
++    return (
++        <SidebarCategoryGenericMenu
++            id={group.id}
++            name={group.name}
++        >
++            <MarkAsReadMenuItem
++                id={group.id}
++                handleViewCategory={() => dispatch(readMultipleChannels(unreadIds))}
++                numChannels={unreadIds.length}
++            />
++            <Menu.Separator/>
++            {group.id !== DM_GROUP_ID && (
++                <Menu.Item
++                    id={`mute-${group.id}`}
++                    onClick={toggleMute}
++                    leadingElement={<BellOutlineIcon size={18}/>}
++                    labels={isMuted ? (
++                        <FormattedMessage
++                            id='sidebar_left.sidebar_category_menu.unmuteCategory'
++                            defaultMessage='Unmute Category'
++                        />
++                    ) : (
++                        <FormattedMessage
++                            id='sidebar_left.sidebar_category_menu.muteCategory'
++                            defaultMessage='Mute Category'
++                        />
++                    )}
++                />
++            )}
++            <Menu.Item
++                id={`rename-${group.id}`}
++                onClick={onRename}
++                leadingElement={<PencilOutlineIcon size={18}/>}
++                labels={
++                    <FormattedMessage
++                        id='sidebar_left.sidebar_category_menu.renameCategory'
++                        defaultMessage='Rename Category'
++                    />
++                }
++            />
++            {!isBuiltInGroup(group.id) && (
++                <Menu.Item
++                    id={`delete-${group.id}`}
++                    isDestructive={true}
++                    onClick={() => setAllTeamsLayout(deleteGroup(getAllTeamsLayout(), group.id))}
++                    leadingElement={<TrashCanOutlineIcon size={18}/>}
++                    labels={
++                        <FormattedMessage
++                            id='sidebar_left.sidebar_category_menu.deleteCategory'
++                            defaultMessage='Delete Category'
++                        />
++                    }
++                />
++            )}
++            <Menu.Separator/>
++            <Menu.SubMenu
++                id={`sortChannels-${group.id}`}
++                leadingElement={sortIcons[group.sorting]}
++                labels={
++                    <FormattedMessage
++                        id='sidebar.sort'
++                        defaultMessage='Sort'
++                    />
++                }
++                trailingElements={(
++                    <>
++                        {sortLabels[group.sorting]}
++                        <ChevronRightIcon size={16}/>
++                    </>
++                )}
++                menuId={`sortChannels-${group.id}-menu`}
++            >
++                {sortItem('alpha', alphaLabel)}
++                {sortItem('recency', recencyLabel)}
++                {sortItem('manual', manualLabel)}
++                <Menu.Separator/>
++                <Menu.Item
++                    id={`unreadFirst-${group.id}`}
++                    labels={<span>{'Unread on top'}</span>}
++                    onClick={() => setAllTeamsLayout(setGroupOptions(getAllTeamsLayout(), group.id, {unreadFirst: !unreadFirst, groupByTeam: group.groupByTeam}))}
++                    trailingElements={unreadFirst ? <CheckIcon size={16}/> : null}
++                />
++                <Menu.Item
++                    id={`groupByTeam-${group.id}`}
++                    labels={<span>{'Group by team'}</span>}
++                    onClick={() => setAllTeamsLayout(setGroupOptions(getAllTeamsLayout(), group.id, {unreadFirst: group.unreadFirst, groupByTeam: !group.groupByTeam}))}
++                    trailingElements={group.groupByTeam ? <CheckIcon size={16}/> : null}
++                />
++            </Menu.SubMenu>
++            <Menu.Separator/>
++            <Menu.Item
++                id={`create-${group.id}`}
++                onClick={() => requestNewGroup()}
++                leadingElement={<FolderPlusOutlineIcon size={18}/>}
++                labels={
++                    <FormattedMessage
++                        id='sidebar_left.sidebar_category_menu.createCategory'
++                        defaultMessage='Create New Category'
++                    />
++                }
++            />
++        </SidebarCategoryGenericMenu>
++    );
++}
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.scss b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.scss
+index d3549a21..0acb9dfa 100644
+--- a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.scss
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.scss
+@@ -27,34 +27,3 @@
+     color: var(--sidebar-text);
+     font-size: 12px;
+ }
+-
+-.AllTeamsList__action {
+-    width: 24px;
+-    min-width: 24px;
+-    height: 24px;
+-    padding: 0;
+-    border: none;
+-    border-radius: 4px;
+-    margin-right: 2px;
+-    background: transparent;
+-    color: rgba(var(--sidebar-text-rgb), 0.64);
+-    font-size: 14px;
+-    line-height: 14px;
+-
+-    &:hover {
+-        background-color: rgba(255, 255, 255, 0.08);
+-        color: var(--sidebar-text);
+-    }
+-
+-    &:last-child {
+-        margin-right: 16px;
+-    }
+-
+-    &--onHover {
+-        display: none;
+-    }
+-}
+-
+-.SidebarChannelGroupHeader:hover .AllTeamsList__action--onHover {
+-    display: inline-block;
+-}
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.test.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.test.tsx
+index 64d89203..48eb187f 100644
+--- a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.test.tsx
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.test.tsx
+@@ -3,8 +3,8 @@
+ 
+ import React from 'react';
+ 
+-import {renderWithContext, screen, userEvent} from 'tests/react_testing_utils';
+-import {getAllTeamsLayout, makeDefaultLayout, setAllTeamsLayout} from 'utils/all_teams_mode';
++import {act, fireEvent, renderWithContext, screen, userEvent, waitFor} from 'tests/react_testing_utils';
++import {getAllTeamsLayout, makeDefaultLayout, requestNewGroup, setAllTeamsLayout} from 'utils/all_teams_mode';
+ 
+ import AllTeamsList from './all_teams_list';
+ 
+@@ -33,26 +33,27 @@ describe('AllTeamsList', () => {
+ 
+     const render = () => renderWithContext(<AllTeamsList setChannelRef={jest.fn()}/>, state as never);
+ 
+-    test('creates, persists and deletes a category', async () => {
+-        render();
++    const openMenu = async (groupId: string) => {
++        await userEvent.click(document.getElementById(`SidebarCategoryMenu-Button-${groupId}`)!);
++    };
++
++    const createCategory = async (name: string) => {
+         await userEvent.click(screen.getByText('New category'));
+-        await userEvent.type(screen.getByPlaceholderText('Category name'), 'Mine{Enter}');
++        await userEvent.type(screen.getByPlaceholderText('Category name'), `${name}{Enter}`);
++    };
+ 
++    test('creates and persists a category, escape cancels', async () => {
++        render();
++        await createCategory('Mine');
+         expect(screen.getByText('Mine')).toBeInTheDocument();
+         expect(JSON.parse(window.localStorage.getItem('mm_all_teams_layout')!).groups.map((g: {name: string}) => g.name)).toEqual(['Mine', 'Channels', 'Direct messages']);
+ 
+-        await userEvent.click(screen.getAllByLabelText('Delete category')[0]);
+-        expect(screen.queryByText('Mine')).not.toBeInTheDocument();
+-    });
+-
+-    test('escape cancels creating a category', async () => {
+-        render();
+         await userEvent.click(screen.getByText('New category'));
+-        await userEvent.type(screen.getByPlaceholderText('Category name'), 'Mine{Escape}');
+-        expect(getAllTeamsLayout().groups).toHaveLength(2);
++        await userEvent.type(screen.getByPlaceholderText('Category name'), 'Nope{Escape}');
++        expect(getAllTeamsLayout().groups).toHaveLength(3);
+     });
+ 
+-    test('collapse hides read channels, expand brings them back', async () => {
++    test('collapse hides channels, expand brings them back', async () => {
+         render();
+         expect(screen.getByText('c1')).toBeInTheDocument();
+         await userEvent.click(screen.getByRole('button', {name: 'Channels'}));
+@@ -61,15 +62,67 @@ describe('AllTeamsList', () => {
+         expect(screen.getByText('c1')).toBeInTheDocument();
+     });
+ 
+-    test('renames a category and cycles its sorting', async () => {
++    test('built-in categories offer no delete, DMs offer no mute', async () => {
++        render();
++        await openMenu('default');
++        expect(await screen.findByText('Mute Category')).toBeInTheDocument();
++        expect(screen.queryByText('Delete Category')).not.toBeInTheDocument();
++        await userEvent.keyboard('{Escape}');
++        await waitFor(() => expect(screen.queryByText('Mute Category')).not.toBeInTheDocument());
++
++        await openMenu('dms');
++        expect(await screen.findByText('Rename Category')).toBeInTheDocument();
++        expect(screen.queryByText('Mute Category')).not.toBeInTheDocument();
++    });
++
++    test('renames from the menu and the field keeps focus', async () => {
+         render();
+-        await userEvent.click(screen.getAllByLabelText('Rename category')[0]);
+-        const input = screen.getByPlaceholderText('Category name');
++        await openMenu('default');
++        await userEvent.click(await screen.findByText('Rename Category'));
++        const input = await screen.findByPlaceholderText('Category name');
++        await waitFor(() => expect(input).toHaveFocus());
+         await userEvent.clear(input);
+         await userEvent.type(input, 'Rest{Enter}');
+-        expect(screen.getByText('Rest')).toBeInTheDocument();
++        expect(await screen.findByText('Rest')).toBeInTheDocument();
++    });
++
++    test('deletes a custom category from the menu', async () => {
++        render();
++        await createCategory('Mine');
++        const id = getAllTeamsLayout().groups[0].id;
++        await openMenu(id);
++        await userEvent.click(await screen.findByText('Delete Category'));
++        await waitFor(() => expect(screen.queryByText('Mine')).not.toBeInTheDocument());
++        expect(getAllTeamsLayout().groups).toHaveLength(2);
++    });
+ 
+-        await userEvent.click(screen.getAllByLabelText(/Sorted by recent activity/)[0]);
++    test('the sort submenu sets sorting and options', async () => {
++        render();
++        const pick = async (label: string) => {
++            await openMenu('default');
++            fireEvent.mouseOver(document.getElementById('sortChannels-default')!);
++            await userEvent.click(await screen.findByText(label));
++            await waitFor(() => expect(document.getElementById('sortChannels-default')).toBeNull());
++        };
++
++        await pick('Alphabetically');
+         expect(getAllTeamsLayout().groups[0].sorting).toBe('alpha');
++        await pick('Manually');
++        expect(getAllTeamsLayout().groups[0].sorting).toBe('manual');
++        await pick('Unread on top');
++        expect(getAllTeamsLayout().groups[0].unreadFirst).toBe(true);
++        await pick('Group by team');
++        expect(getAllTeamsLayout().groups[0].groupByTeam).toBe(true);
++        expect(getAllTeamsLayout().groups[0].unreadFirst).toBe(true);
++    });
++
++    test('a channel from the Move To request lands in the new category', async () => {
++        render();
++        act(() => requestNewGroup(['c1']));
++        await userEvent.type(await screen.findByPlaceholderText('Category name'), 'Mine{Enter}');
++        const [mine, channels] = getAllTeamsLayout().groups;
++        expect(mine.name).toBe('Mine');
++        expect(mine.channelIds).toEqual(['c1']);
++        expect(channels.channelIds).toEqual([]);
+     });
+ });
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
+index 5518b848..2c985450 100644
+--- a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
+@@ -20,43 +20,30 @@ import SidebarChannel from 'components/sidebar/sidebar_channel';
+ 
+ import {
+     addGroup,
+-    DEFAULT_GROUP_ID,
+-    deleteGroup,
+-    DM_GROUP_ID,
++    assignChannels,
++    canGroupHold,
++    finishNewGroupRequest,
+     getAllTeamsLayout,
+-    isBuiltInGroup,
+     moveChannel,
+     moveGroup,
+     renameGroup,
++    requestNewGroup,
+     setAllTeamsLayout,
+     setGroupCollapsed,
+-    setGroupSorting,
+     syncAllTeamsLayout,
+     useAllTeamsLayout,
++    useNewGroupRequest,
+ } from 'utils/all_teams_mode';
+-import type {AllTeamsSorting} from 'utils/all_teams_mode';
+ import {generateId} from 'utils/utils';
+ 
+ import type {GlobalState} from 'types/store';
+ 
++import AllTeamsCategoryMenu from './all_teams_category_menu';
++
+ import './all_teams_list.scss';
+ 
+ const GROUPS_DROPPABLE_ID = 'all-teams-groups';
+ 
+-const NEXT_SORTING: Record<AllTeamsSorting, AllTeamsSorting> = {manual: 'recency', recency: 'alpha', alpha: 'manual'};
+-
+-const SORTING_ICONS: Record<AllTeamsSorting, string> = {
+-    manual: 'icon-drag-vertical',
+-    recency: 'icon-clock-outline',
+-    alpha: 'icon-sort-alphabetical-ascending',
+-};
+-
+-const SORTING_TITLES: Record<AllTeamsSorting, string> = {
+-    manual: 'Manual order. Click to sort by recent activity',
+-    recency: 'Sorted by recent activity. Click to sort A-Z',
+-    alpha: 'Sorted A-Z. Click to switch to manual order',
+-};
+-
+ type NameInputProps = {
+     initialValue: string;
+     onDone: (name: string) => void;
+@@ -100,7 +87,7 @@ export default function AllTeamsList({setChannelRef}: Props) {
+         syncAllTeamsLayout();
+     }, []);
+ 
+-    const [isCreating, setIsCreating] = useState(false);
++    const newGroupChannelIds = useNewGroupRequest();
+     const [editingId, setEditingId] = useState('');
+     const [draggedGroupId, setDraggedGroupId] = useState('');
+     const [draggedKind, setDraggedKind] = useState<'dm' | 'channel' | ''>('');
+@@ -147,20 +134,23 @@ export default function AllTeamsList({setChannelRef}: Props) {
+     };
+ 
+     const finishCreating = (name: string) => {
+-        setIsCreating(false);
++        const channelIds = newGroupChannelIds ?? [];
++        finishNewGroupRequest();
+         if (name) {
+-            setAllTeamsLayout(addGroup(layout, generateId(), name));
++            const id = generateId();
++            setAllTeamsLayout(assignChannels(addGroup(getAllTeamsLayout(), id, name), channelIds, id));
+         }
+     };
+ 
+     const finishRenaming = (groupId: string, name: string) => {
+         setEditingId('');
+         if (name) {
+-            setAllTeamsLayout(renameGroup(layout, groupId, name));
++            setAllTeamsLayout(renameGroup(getAllTeamsLayout(), groupId, name));
+         }
+     };
+ 
+-    const renderGroup = ({group, shownIds}: AllTeamsShownGroup, groupIndex: number) => {
++    const renderGroup = (shownGroup: AllTeamsShownGroup, groupIndex: number) => {
++        const {group, shownIds} = shownGroup;
+         const isEditing = editingId === group.id;
+         const isDragged = draggedGroupId === group.id;
+ 
+@@ -182,8 +172,7 @@ export default function AllTeamsList({setChannelRef}: Props) {
+                             droppableId={group.id}
+                             type='SIDEBAR_CHANNEL'
+ 
+-                            // DMs and channels only mix in custom categories, as in native ones.
+-                            isDropDisabled={(group.id === DM_GROUP_ID && draggedKind === 'channel') || (group.id === DEFAULT_GROUP_ID && draggedKind === 'dm')}
++                            isDropDisabled={draggedKind !== '' && !canGroupHold(group.id, draggedKind === 'dm')}
+                         >
+                             {(droppableProvided, droppableSnapshot) => (
+                                 <div
+@@ -204,35 +193,13 @@ export default function AllTeamsList({setChannelRef}: Props) {
+                                             isCollapsible={true}
+                                             isDragging={snapshot.isDragging}
+                                             isDraggingOver={droppableSnapshot.isDraggingOver}
+-                                            muted={false}
++                                            muted={shownGroup.isMuted}
+                                             onClick={() => setAllTeamsLayout(setGroupCollapsed(layout, group.id, !group.collapsed))}
+                                         >
+-                                            <button
+-                                                className='AllTeamsList__action AllTeamsList__action--onHover'
+-                                                title='Rename category'
+-                                                aria-label='Rename category'
+-                                                onClick={() => setEditingId(group.id)}
+-                                            >
+-                                                <i className='icon icon-pencil-outline'/>
+-                                            </button>
+-                                            {!isBuiltInGroup(group.id) && (
+-                                                <button
+-                                                    className='AllTeamsList__action AllTeamsList__action--onHover'
+-                                                    title='Delete category. Its channels go back to Channels and Direct messages'
+-                                                    aria-label='Delete category'
+-                                                    onClick={() => setAllTeamsLayout(deleteGroup(layout, group.id))}
+-                                                >
+-                                                    <i className='icon icon-trash-can-outline'/>
+-                                                </button>
+-                                            )}
+-                                            <button
+-                                                className='AllTeamsList__action'
+-                                                title={SORTING_TITLES[group.sorting]}
+-                                                aria-label={SORTING_TITLES[group.sorting]}
+-                                                onClick={() => setAllTeamsLayout(setGroupSorting(layout, group.id, NEXT_SORTING[group.sorting]))}
+-                                            >
+-                                                <i className={`icon ${SORTING_ICONS[group.sorting]}`}/>
+-                                            </button>
++                                            <AllTeamsCategoryMenu
++                                                shownGroup={shownGroup}
++                                                onRename={() => setEditingId(group.id)}
++                                            />
+                                         </SidebarCategoryHeader>
+                                     )}
+                                     <div className='SidebarChannelGroup_content'>
+@@ -264,7 +231,7 @@ export default function AllTeamsList({setChannelRef}: Props) {
+ 
+     return (
+         <>
+-            {isCreating ? (
++            {newGroupChannelIds ? (
+                 <NameInput
+                     initialValue=''
+                     onDone={finishCreating}
+@@ -272,7 +239,7 @@ export default function AllTeamsList({setChannelRef}: Props) {
+             ) : (
+                 <button
+                     className='AllTeamsList__newGroup'
+-                    onClick={() => setIsCreating(true)}
++                    onClick={() => requestNewGroup()}
+                 >
+                     <i className='icon icon-plus'/>
+                     {'New category'}
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.test.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.test.tsx
+new file mode 100644
+index 00000000..e1f4a898
+--- /dev/null
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.test.tsx
+@@ -0,0 +1,71 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import React from 'react';
++
++import type {Channel} from '@mattermost/types/channels';
++
++import * as Menu from 'components/menu';
++
++import {fireEvent, renderWithContext, screen, userEvent, waitFor} from 'tests/react_testing_utils';
++import {addGroup, assignChannels, getAllTeamsLayout, makeDefaultLayout, setAllTeamsLayout} from 'utils/all_teams_mode';
++
++import AllTeamsMoveToSubMenu from './all_teams_move_to_sub_menu';
++
++const channel = {id: 'c1', type: 'O', team_id: 't1'} as Channel;
++const dm = {id: 'd1', type: 'D', team_id: ''} as Channel;
++
++function renderMenu(target: Channel, multiSelectedChannelIds: string[] = []) {
++    renderWithContext(
++        <Menu.Container
++            menuButton={{id: 'open', children: 'open'}}
++            menu={{id: 'menu'}}
++        >
++            <AllTeamsMoveToSubMenu channel={target}/>
++        </Menu.Container>,
++        {
++            entities: {channels: {channels: {c1: channel, c2: {...channel, id: 'c2'}, d1: dm}}},
++            views: {channelSidebar: {multiSelectedChannelIds}},
++        } as never,
++    );
++}
++
++async function openSubMenu(target: Channel) {
++    await userEvent.click(document.getElementById('open')!);
++    await waitFor(() => expect(document.getElementById(`moveTo-${target.id}`)).toBeInTheDocument());
++    fireEvent.mouseOver(document.getElementById(`moveTo-${target.id}`)!);
++    await screen.findByText('New Category');
++}
++
++describe('AllTeamsMoveToSubMenu', () => {
++    beforeEach(() => setAllTeamsLayout(addGroup(makeDefaultLayout(), 'g', 'Mine')));
++
++    test('lists ALL categories without Favorites or the DM group, and moves the channel', async () => {
++        renderMenu(channel);
++        await openSubMenu(channel);
++
++        expect(screen.getByText('Mine')).toBeInTheDocument();
++        expect(screen.getByText('Channels')).toBeInTheDocument();
++        expect(screen.queryByText('Direct messages')).not.toBeInTheDocument();
++        expect(screen.queryByText('Favorites')).not.toBeInTheDocument();
++
++        await userEvent.click(screen.getByText('Mine'));
++        await waitFor(() => expect(getAllTeamsLayout().groups[0].channelIds).toEqual(['c1']));
++    });
++
++    test('a DM can go to custom categories and its own group, not to Channels', async () => {
++        setAllTeamsLayout(assignChannels(getAllTeamsLayout(), ['d1'], 'g'));
++        renderMenu(dm);
++        await openSubMenu(dm);
++
++        expect(screen.getByText('Direct messages')).toBeInTheDocument();
++        expect(screen.queryByText('Channels')).not.toBeInTheDocument();
++    });
++
++    test('moves the whole selection when opened on a selected channel', async () => {
++        renderMenu(channel, ['c1', 'c2']);
++        await openSubMenu(channel);
++        await userEvent.click(screen.getByText('Mine'));
++        await waitFor(() => expect(getAllTeamsLayout().groups[0].channelIds).toEqual(['c1', 'c2']));
++    });
++});
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.tsx
+new file mode 100644
+index 00000000..3edcaf2d
+--- /dev/null
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.tsx
+@@ -0,0 +1,109 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): "Move to..." listing the categories of the ALL pseudo-team.
++
++import React from 'react';
++import {FormattedMessage} from 'react-intl';
++import {useDispatch, useSelector} from 'react-redux';
++
++import {
++    CheckIcon,
++    ChevronRightIcon,
++    FolderMoveOutlineIcon,
++    FolderOutlineIcon,
++} from '@mattermost/compass-icons/components';
++import type {Channel} from '@mattermost/types/channels';
++
++import {General} from 'mattermost-redux/constants';
++import {getAllChannels} from 'mattermost-redux/selectors/entities/channels';
++
++import {clearChannelSelection} from 'actions/views/channel_sidebar';
++
++import * as Menu from 'components/menu';
++
++import {
++    assignChannels,
++    canGroupHold,
++    findGroupId,
++    getAllTeamsLayout,
++    requestNewGroup,
++    setAllTeamsLayout,
++    useAllTeamsLayout,
++} from 'utils/all_teams_mode';
++
++import type {GlobalState} from 'types/store';
++
++type Props = {
++    channel: Channel;
++    inHeaderDropdown?: boolean;
++};
++
++const isDmChannel = (channel?: Channel) => channel?.type === General.DM_CHANNEL || channel?.type === General.GM_CHANNEL;
++
++export default function AllTeamsMoveToSubMenu({channel, inHeaderDropdown}: Props) {
++    const dispatch = useDispatch();
++    const layout = useAllTeamsLayout();
++    const allChannels = useSelector(getAllChannels);
++    const multiSelectedIds = useSelector((state: GlobalState) => state.views.channelSidebar.multiSelectedChannelIds);
++
++    // As in the native menu, opening it on a selected channel acts on the whole selection.
++    const channelIds = !inHeaderDropdown && multiSelectedIds.includes(channel.id) ? multiSelectedIds : [channel.id];
++    const currentGroupId = findGroupId(layout, channel.id, isDmChannel(channel));
++
++    const moveTo = (groupId: string) => {
++        setAllTeamsLayout(assignChannels(getAllTeamsLayout(), channelIds, groupId));
++        dispatch(clearChannelSelection());
++    };
++
++    const moveToNewCategory = () => {
++        requestNewGroup(channelIds);
++        dispatch(clearChannelSelection());
++    };
++
++    const groups = layout.groups.filter((group) => channelIds.every((id) => canGroupHold(group.id, isDmChannel(allChannels[id]))));
++
++    return (
++        <Menu.SubMenu
++            id={`moveTo-${channel.id}`}
++            labels={
++                <FormattedMessage
++                    id='sidebar_left.sidebar_channel_menu.moveTo'
++                    defaultMessage='Move to...'
++                />
++            }
++            leadingElement={inHeaderDropdown ? null : <FolderMoveOutlineIcon size={18}/>}
++            trailingElements={<ChevronRightIcon size={16}/>}
++            menuId={`moveTo-${channel.id}-menu`}
++        >
++            {groups.map((group) => (
++                <Menu.Item
++                    id={`moveToCategory-${channel.id}-${group.id}`}
++                    key={group.id}
++                    leadingElement={<FolderOutlineIcon size={18}/>}
++                    labels={<span>{group.name}</span>}
++                    trailingElements={group.id === currentGroupId ? (
++                        <CheckIcon
++                            color='var(--button-bg)'
++                            size={18}
++                        />
++                    ) : null}
++                    onClick={() => moveTo(group.id)}
++                />
++            ))}
++            <Menu.Separator key='moveToDivider'/>
++            <Menu.Item
++                id={`moveToNewCategory-${channel.id}`}
++                key='moveToNewCategory'
++                leadingElement={<FolderMoveOutlineIcon size={18}/>}
++                labels={
++                    <FormattedMessage
++                        id='sidebar_left.sidebar_channel_menu.moveToNewCategory'
++                        defaultMessage='New Category'
++                    />
++                }
++                onClick={moveToNewCategory}
++            />
++        </Menu.SubMenu>
++    );
++}
+diff --git a/webapp/channels/src/selectors/views/all_teams.test.ts b/webapp/channels/src/selectors/views/all_teams.test.ts
+index 78162504..ab1002a9 100644
+--- a/webapp/channels/src/selectors/views/all_teams.test.ts
++++ b/webapp/channels/src/selectors/views/all_teams.test.ts
+@@ -1,7 +1,7 @@
+ // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+ // See LICENSE.txt for license information.
+ 
+-import {addGroup, deleteGroup, makeDefaultLayout, moveChannel, moveGroup, parseLayout, setGroupCollapsed, setGroupSorting} from 'utils/all_teams_mode';
++import {addGroup, assignChannels, canGroupHold, deleteGroup, findGroupId, makeDefaultLayout, moveChannel, moveGroup, parseLayout, setGroupCollapsed, setGroupOptions, setGroupSorting} from 'utils/all_teams_mode';
+ import type {AllTeamsLayout} from 'utils/all_teams_mode';
+ import {TestHelper} from 'utils/test_helper';
+ 
+@@ -32,6 +32,7 @@ const state = {
+             myMembers: {a: member(1), b: member(1), c: member(1), dm1: member(1), dm2: member(1), closedDm: member(1)},
+         },
+         general: {config: {}},
++        teams: {teams: {t1: {display_name: 'Zebra'}, t2: {display_name: 'Mango'}, t3: {display_name: 'Apple'}}},
+         preferences: {myPreferences: {
+             'direct_channel_show--gone': {value: 'false'},
+             'direct_channel_show--zoe': {value: 'true'},
+@@ -128,6 +129,59 @@ describe('ALL pseudo-team layout', () => {
+         expect(deleteGroup(base, 'dms')).toBe(base);
+     });
+ 
++    const manual = (ids: string[]) => setGroupSorting({groups: [{...base.groups[0], channelIds: ids}, base.groups[1]]}, 'default', 'manual');
++
++    test('unread on top works with every sorting and keeps a manual order', () => {
++        const opts = {unreadFirst: true};
++        expect(shown(setGroupOptions(setGroupSorting(base, 'default', 'alpha'), 'default', opts))).toEqual([['default', ['c', 'a', 'b']]]);
++        expect(shown(setGroupOptions(base, 'default', opts))).toEqual([['default', ['c', 'b', 'a']]]);
++        expect(shown(setGroupOptions(manual(['b', 'a', 'c']), 'default', opts))).toEqual([['default', ['c', 'b', 'a']]]);
++    });
++
++    test('group by team orders teams by name and sorts inside them', () => {
++        expect(shown(setGroupOptions(base, 'default', {groupByTeam: true}))).toEqual([['default', ['c', 'b', 'a']]]);
++    });
++
++    test('group by team puts DMs after the teams in a mixed category', () => {
++        const layout = setGroupOptions(assignChannels(addGroup(base, 'g', 'Mine'), ['dm1', 'a', 'c'], 'g'), 'g', {groupByTeam: true});
++        expect(allShown(layout)).toContainEqual(['g', ['c', 'a', 'dm1']]);
++    });
++
++    test('category data covers collapsed channels', () => {
++        const [channels] = makeGetAllTeamsGroups()(state, setGroupCollapsed(base, 'default', true));
++        expect(channels.shownIds).toEqual(['a']);
++        expect(channels.channelIds).toEqual(['b', 'c', 'a']);
++        expect(channels.unreadIds).toEqual(['c']);
++        expect(channels.isMuted).toBe(false);
++    });
++
++    test('move to keeps the sorting and lands on top of a manual order', () => {
++        const layout = assignChannels(manual(['a', 'b']), ['c'], 'default');
++        expect(layout.groups[0].sorting).toBe('manual');
++        expect(layout.groups[0].channelIds).toEqual(['c', 'a', 'b']);
++
++        const moved = assignChannels(addGroup(base, 'g', 'Mine'), ['b', 'a'], 'g');
++        expect(moved.groups[0].sorting).toBe('manual');
++        expect(allShown(moved)).toContainEqual(['g', ['b', 'a']]);
++    });
++
++    test('move to back into a built-in category leaves the custom one', () => {
++        const inGroup = assignChannels(addGroup(base, 'g', 'Mine'), ['a'], 'g');
++        expect(findGroupId(inGroup, 'a', false)).toBe('g');
++        const back = assignChannels(inGroup, ['a'], 'default');
++        expect(findGroupId(back, 'a', false)).toBe('default');
++        expect(back.groups[0].channelIds).toEqual([]);
++    });
++
++    test('channels and DMs only mix in custom categories', () => {
++        expect(canGroupHold('dms', false)).toBe(false);
++        expect(canGroupHold('default', true)).toBe(false);
++        expect(canGroupHold('g', true)).toBe(true);
++        expect(canGroupHold('g', false)).toBe(true);
++        expect(findGroupId(base, 'nowhere', true)).toBe('dms');
++        expect(findGroupId(base, 'nowhere', false)).toBe('default');
++    });
++
+     test('reorders categories', () => {
+         expect(moveGroup(addGroup(base, 'g', 'Mine'), 'g', 1).groups.map((g) => g.id)).toEqual(['default', 'g', 'dms']);
+     });
+diff --git a/webapp/channels/src/selectors/views/all_teams.ts b/webapp/channels/src/selectors/views/all_teams.ts
+index c07cb2a7..bdbf5fd8 100644
+--- a/webapp/channels/src/selectors/views/all_teams.ts
++++ b/webapp/channels/src/selectors/views/all_teams.ts
+@@ -15,7 +15,7 @@ import {makeFilterAndSortChannelsForCategory} from 'mattermost-redux/selectors/e
+ import {getAllChannels, getAllDirectChannels, getChannelMessageCounts, getCurrentChannelId, getMyChannelMemberships} from 'mattermost-redux/selectors/entities/channels';
+ import {getCurrentUserLocale} from 'mattermost-redux/selectors/entities/i18n';
+ import {isCollapsedThreadsEnabled, shouldShowUnreadsCategory} from 'mattermost-redux/selectors/entities/preferences';
+-import {calculateUnreadCount} from 'mattermost-redux/utils/channel_utils';
++import {calculateUnreadCount, isChannelMuted} from 'mattermost-redux/utils/channel_utils';
+ 
+ import {DEFAULT_GROUP_ID, DM_GROUP_ID} from 'utils/all_teams_mode';
+ import type {AllTeamsGroup, AllTeamsLayout} from 'utils/all_teams_mode';
+@@ -27,6 +27,12 @@ export type AllTeamsShownGroup = {
+ 
+     // In display order. A collapsed group only shows the current channel.
+     shownIds: string[];
++
++    // For the actions on the whole category, which don't depend on what's collapsed.
++    channelIds: string[];
++    unreadIds: string[];
++    isMuted: boolean;
++    unreadFirst: boolean;
+ };
+ 
+ // Native filtering decides which DMs are open: the "direct messages" type also applies the limit on
+@@ -64,10 +70,11 @@ export function makeGetAllTeamsGroups(): (state: GlobalState, layout: AllTeamsLa
+         (state: GlobalState) => isCollapsedThreadsEnabled(state),
+         (state: GlobalState) => shouldShowUnreadsCategory(state),
+         (state: GlobalState) => getCurrentUserLocale(state),
++        (state: GlobalState) => state.entities.teams.teams,
+         (_: GlobalState, layout: AllTeamsLayout) => layout,
+         (_: GlobalState, _layout: AllTeamsLayout, openDms: Channel[]) => openDms,
+         (_: GlobalState, _layout: AllTeamsLayout, _openDms: Channel[], dmGroupDms: Channel[]) => dmGroupDms,
+-        (allChannels, myMembers, messageCounts, currentChannelId, crtEnabled, unreadsFirst, locale, layout, openDms, dmGroupDms) => {
++        (allChannels, myMembers, messageCounts, currentChannelId, crtEnabled, unreadsPreference, locale, teams, layout, openDms, dmGroupDms) => {
+             // DMs come with their display name filled in, which the raw channels don't have.
+             const channelsById: Record<string, Channel> = {...allChannels};
+             openDms.forEach((dm) => {
+@@ -112,20 +119,39 @@ export function makeGetAllTeamsGroups(): (state: GlobalState, layout: AllTeamsLa
+             return layout.groups.map((group) => {
+                 const channels = getGroupIds(group).map((id) => channelsById[id]).filter(isListed);
+ 
+-                if (group.sorting !== 'manual') {
+-                    channels.sort((a, b) => {
+-                        if (unreadsFirst && isUnread(a.id) !== isUnread(b.id)) {
+-                            return isUnread(a.id) ? -1 : 1;
+-                        }
+-                        if (group.sorting === 'alpha') {
+-                            return a.display_name.localeCompare(b.display_name, locale, {numeric: true});
++                const unreadFirst = group.unreadFirst ?? (unreadsPreference && group.sorting !== 'manual');
++                const teamName = (channel: Channel) => teams[channel.team_id]?.display_name ?? '';
++
++                // Sorting is stable, so a manual order survives inside the groups the options make.
++                channels.sort((a, b) => {
++                    if (group.groupByTeam && teamName(a) !== teamName(b)) {
++                        // DMs have no team and go last.
++                        if (!teamName(a) || !teamName(b)) {
++                            return teamName(a) ? -1 : 1;
+                         }
++                        return teamName(a).localeCompare(teamName(b), locale, {numeric: true});
++                    }
++                    if (unreadFirst && isUnread(a.id) !== isUnread(b.id)) {
++                        return isUnread(a.id) ? -1 : 1;
++                    }
++                    if (group.sorting === 'alpha') {
++                        return a.display_name.localeCompare(b.display_name, locale, {numeric: true});
++                    }
++                    if (group.sorting === 'recency') {
+                         return lastActivity(b) - lastActivity(a);
+-                    });
+-                }
++                    }
++                    return 0;
++                });
+ 
+                 const shown = group.collapsed ? channels.filter((channel) => channel.id === currentChannelId) : channels;
+-                return {group, shownIds: shown.map((channel) => channel.id)};
++                return {
++                    group,
++                    shownIds: shown.map((channel) => channel.id),
++                    channelIds: channels.map((channel) => channel.id),
++                    unreadIds: channels.filter((channel) => isUnread(channel.id)).map((channel) => channel.id),
++                    isMuted: channels.length > 0 && channels.every((channel) => isChannelMuted(myMembers[channel.id])),
++                    unreadFirst,
++                };
+             });
+         },
+     );
+diff --git a/webapp/channels/src/utils/all_teams_mode.ts b/webapp/channels/src/utils/all_teams_mode.ts
+index 618e0b15..4db7998d 100644
+--- a/webapp/channels/src/utils/all_teams_mode.ts
++++ b/webapp/channels/src/utils/all_teams_mode.ts
+@@ -14,6 +14,10 @@ export type AllTeamsGroup = {
+     name: string;
+     collapsed: boolean;
+     sorting: AllTeamsSorting;
++
++    // Unset means following the "group unread channels" preference for auto-sorted categories.
++    unreadFirst?: boolean;
++    groupByTeam?: boolean;
+     channelIds: string[];
+ };
+ 
+@@ -86,6 +90,36 @@ export function setGroupSorting(layout: AllTeamsLayout, groupId: string, sorting
+     return updateGroup(layout, groupId, {sorting});
+ }
+ 
++export function setGroupOptions(layout: AllTeamsLayout, groupId: string, options: Pick<AllTeamsGroup, 'unreadFirst' | 'groupByTeam'>): AllTeamsLayout {
++    return updateGroup(layout, groupId, options);
++}
++
++// DMs and channels only mix in custom categories, as in native ones.
++export function canGroupHold(groupId: string, isDm: boolean) {
++    return isDm ? groupId !== DEFAULT_GROUP_ID : groupId !== DM_GROUP_ID;
++}
++
++export function findGroupId(layout: AllTeamsLayout, channelId: string, isDm: boolean) {
++    const holder = layout.groups.find((group) => group.channelIds.includes(channelId));
++    if (holder) {
++        return holder.id;
++    }
++    return isDm ? DM_GROUP_ID : DEFAULT_GROUP_ID;
++}
++
++// Unlike a drop, this has no position to pin, so the category keeps its sorting.
++export function assignChannels(layout: AllTeamsLayout, channelIds: string[], destinationId: string): AllTeamsLayout {
++    return {
++        groups: layout.groups.map((group) => {
++            const others = group.channelIds.filter((id) => !channelIds.includes(id));
++            if (group.id === destinationId) {
++                return {...group, channelIds: [...channelIds, ...others]};
++            }
++            return others.length === group.channelIds.length ? group : {...group, channelIds: others};
++        }),
++    };
++}
++
+ // Its channels fall back to the built-in groups, because nothing else claims them any more.
+ export function deleteGroup(layout: AllTeamsLayout, groupId: string): AllTeamsLayout {
+     if (isBuiltInGroup(groupId)) {
+@@ -145,6 +179,7 @@ let layoutState = parseLayout(readStorage(LAYOUT_KEY));
+ let syncStarted = false;
+ let canPush = false;
+ let pushQueue: Promise<unknown> = Promise.resolve();
++let newGroupChannelIds: string[] | null = null;
+ 
+ function emit() {
+     listeners.forEach((listener) => listener());
+@@ -228,6 +263,29 @@ export async function syncAllTeamsLayout() {
+     }
+ }
+ 
++// Asks the list to prompt for a new category's name. The channels, if any, move into it once it's named.
++export function requestNewGroup(channelIds: string[] = []) {
++    newGroupChannelIds = channelIds;
++    emit();
++}
++
++export function finishNewGroupRequest() {
++    newGroupChannelIds = null;
++    emit();
++}
++
++function getNewGroupRequest() {
++    return newGroupChannelIds;
++}
++
++export function useNewGroupRequest() {
++    return useSyncExternalStore(subscribeAllTeams, getNewGroupRequest);
++}
++
++export function useAllTeamsMode() {
++    return useSyncExternalStore(subscribeAllTeams, isAllTeamsMode);
++}
++
+ export function useAllTeamsLayout() {
+     return useSyncExternalStore(subscribeAllTeams, getAllTeamsLayout);
+ }

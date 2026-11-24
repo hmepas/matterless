@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Thu, 5 Nov 2026 09:35:57 +0300
+Subject: [PATCH 05/11] Let a category in ALL mode keep unread channels visible
+ when collapsed
+
+Off by default, because a large category showing its unread channels pushes
+the categories below it down the list.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../all_teams_list/all_teams_category_menu.tsx     |  8 ++++++++
+ .../channels/src/selectors/views/all_teams.test.ts | 14 ++++++++++++++
+ webapp/channels/src/selectors/views/all_teams.ts   |  4 ++--
+ webapp/channels/src/utils/all_teams_mode.ts        |  3 ++-
+ 4 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_category_menu.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_category_menu.tsx
+index fcf3ac80..d9847b38 100644
+--- a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_category_menu.tsx
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_category_menu.tsx
+@@ -12,6 +12,7 @@ import {
+     CheckIcon,
+     ChevronRightIcon,
+     ClockOutlineIcon,
++    EyeOutlineIcon,
+     FolderPlusOutlineIcon,
+     FormatListBulletedIcon,
+     PencilOutlineIcon,
+@@ -181,6 +182,13 @@ export default function AllTeamsCategoryMenu({shownGroup, onRename}: Props) {
+                     trailingElements={group.groupByTeam ? <CheckIcon size={16}/> : null}
+                 />
+             </Menu.SubMenu>
++            <Menu.Item
++                id={`showUnreadWhenCollapsed-${group.id}`}
++                leadingElement={<EyeOutlineIcon size={18}/>}
++                labels={<span>{'Show unread when collapsed'}</span>}
++                onClick={() => setAllTeamsLayout(setGroupOptions(getAllTeamsLayout(), group.id, {showUnreadWhenCollapsed: !group.showUnreadWhenCollapsed}))}
++                trailingElements={group.showUnreadWhenCollapsed ? <CheckIcon size={16}/> : null}
++            />
+             <Menu.Separator/>
+             <Menu.Item
+                 id={`create-${group.id}`}
+diff --git a/webapp/channels/src/selectors/views/all_teams.test.ts b/webapp/channels/src/selectors/views/all_teams.test.ts
+index ab1002a9..7b52a6f5 100644
+--- a/webapp/channels/src/selectors/views/all_teams.test.ts
++++ b/webapp/channels/src/selectors/views/all_teams.test.ts
+@@ -93,6 +93,20 @@ describe('ALL pseudo-team layout', () => {
+         expect(allShown(setGroupCollapsed(base, 'dms', true))).toContainEqual(['dms', []]);
+     });
+ 
++    test('a collapsed category that opted in also shows its unread channels', () => {
++        const collapsed = setGroupCollapsed(base, 'default', true);
++        expect(shown(setGroupOptions(collapsed, 'default', {showUnreadWhenCollapsed: true}))).toEqual([['default', ['c', 'a']]]);
++    });
++
++    test('showing unread when collapsed applies to that category only', () => {
++        const collapsed = setGroupCollapsed(setGroupCollapsed(base, 'default', true), 'dms', true);
++        expect(allShown(setGroupOptions(collapsed, 'dms', {showUnreadWhenCollapsed: true}))).toEqual([['default', ['a']], ['dms', ['dm1']]]);
++    });
++
++    test('showing unread when collapsed changes nothing while expanded', () => {
++        expect(shown(setGroupOptions(base, 'default', {showUnreadWhenCollapsed: true}))).toEqual(shown(base));
++    });
++
+     test('open DMs get their own group, closed ones stay out', () => {
+         expect(allShown(base)).toEqual([['default', ['b', 'c', 'a']], ['dms', ['dm1', 'dm2']]]);
+     });
+diff --git a/webapp/channels/src/selectors/views/all_teams.ts b/webapp/channels/src/selectors/views/all_teams.ts
+index bdbf5fd8..0c6dd12d 100644
+--- a/webapp/channels/src/selectors/views/all_teams.ts
++++ b/webapp/channels/src/selectors/views/all_teams.ts
+@@ -25,7 +25,7 @@ import type {GlobalState} from 'types/store';
+ export type AllTeamsShownGroup = {
+     group: AllTeamsGroup;
+ 
+-    // In display order. A collapsed group only shows the current channel.
++    // In display order. A collapsed group only shows the current channel, plus unread ones if it opted in.
+     shownIds: string[];
+ 
+     // For the actions on the whole category, which don't depend on what's collapsed.
+@@ -143,7 +143,7 @@ export function makeGetAllTeamsGroups(): (state: GlobalState, layout: AllTeamsLa
+                     return 0;
+                 });
+ 
+-                const shown = group.collapsed ? channels.filter((channel) => channel.id === currentChannelId) : channels;
++                const shown = group.collapsed ? channels.filter((channel) => channel.id === currentChannelId || (group.showUnreadWhenCollapsed && isUnread(channel.id))) : channels;
+                 return {
+                     group,
+                     shownIds: shown.map((channel) => channel.id),
+diff --git a/webapp/channels/src/utils/all_teams_mode.ts b/webapp/channels/src/utils/all_teams_mode.ts
+index 4db7998d..85726e48 100644
+--- a/webapp/channels/src/utils/all_teams_mode.ts
++++ b/webapp/channels/src/utils/all_teams_mode.ts
+@@ -18,6 +18,7 @@ export type AllTeamsGroup = {
+     // Unset means following the "group unread channels" preference for auto-sorted categories.
+     unreadFirst?: boolean;
+     groupByTeam?: boolean;
++    showUnreadWhenCollapsed?: boolean;
+     channelIds: string[];
+ };
+ 
+@@ -90,7 +91,7 @@ export function setGroupSorting(layout: AllTeamsLayout, groupId: string, sorting
+     return updateGroup(layout, groupId, {sorting});
+ }
+ 
+-export function setGroupOptions(layout: AllTeamsLayout, groupId: string, options: Pick<AllTeamsGroup, 'unreadFirst' | 'groupByTeam'>): AllTeamsLayout {
++export function setGroupOptions(layout: AllTeamsLayout, groupId: string, options: Pick<AllTeamsGroup, 'unreadFirst' | 'groupByTeam' | 'showUnreadWhenCollapsed'>): AllTeamsLayout {
+     return updateGroup(layout, groupId, options);
+ }
+ 

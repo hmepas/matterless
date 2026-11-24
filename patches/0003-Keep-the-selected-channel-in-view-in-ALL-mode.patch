@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 3 Nov 2026 11:32:11 +0300
+Subject: [PATCH 03/11] Keep the selected channel in view in ALL mode
+
+A click on a channel from another team changes the team, and upstream scrolls
+the sidebar to the top on that, so the list jumped back to its start. ALL mode
+now skips that reset and scrolls instantly to a channel selected by a click or
+by search, once per selection, and only if it isn't visible already.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../sidebar_list/sidebar_list.test.tsx        | 64 +++++++++++++++++++
+ .../sidebar/sidebar_list/sidebar_list.tsx     | 42 +++++++++++-
+ 2 files changed, 104 insertions(+), 2 deletions(-)
+
+diff --git a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.test.tsx b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.test.tsx
+index 8abe4257..c5d8ce4d 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.test.tsx
++++ b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.test.tsx
+@@ -12,6 +12,7 @@ import type {TeamType} from '@mattermost/types/teams';
+ import {CategoryTypes} from 'mattermost-redux/constants/channel_categories';
+ 
+ import {shallowWithIntl} from 'tests/helpers/intl-test-helper';
++import {setAllTeamsMode} from 'utils/all_teams_mode';
+ import {DraggingStates, DraggingStateTypes} from 'utils/constants';
+ import {TestHelper} from 'utils/test_helper';
+ 
+@@ -295,4 +296,67 @@ describe('SidebarList', () => {
+         instance.onDragEnd(channelResult);
+         expect(baseProps.actions.moveChannelsInSidebar).toHaveBeenCalledWith(channelResult.destination!.droppableId, channelResult.destination!.index, channelResult.draggableId);
+     });
++
++    describe('ALL mode', () => {
++        // The list is 100..500 on screen and scrolled to 1000; `item` says where the channel is right now.
++        const renderInAllMode = (item: {top: number; bottom: number}) => {
++            setAllTeamsMode(true);
++            const wrapper = shallowWithIntl(
++                <SidebarList
++                    {...baseProps}
++                    currentChannelId=''
++                />,
++            );
++            const instance = wrapper.instance() as SidebarListComponent;
++            const scrollTop = jest.fn();
++            instance.scrollbar = {
++                current: {
++                    container: {getBoundingClientRect: () => ({top: 100, bottom: 500})},
++                    getScrollTop: () => 1000,
++                    scrollTop,
++                    scrollToTop: jest.fn(),
++                } as any,
++            };
++            instance.channelRefs.set('picked', {getBoundingClientRect: () => item} as any);
++
++            const select = (extra = {}) => wrapper.setProps({currentChannelId: 'picked', ...extra});
++            return {scrollTop, scrollToTop: instance.scrollbar.current!.scrollToTop as jest.Mock, select};
++        };
++
++        afterEach(() => setAllTeamsMode(false));
++
++        test('changing team does not scroll the list to the top', () => {
++            const {scrollToTop, select} = renderInAllMode({top: 200, bottom: 232});
++            select();
++            select({currentTeam: {...baseProps.currentTeam, id: 'other_team'}});
++            expect(scrollToTop).not.toHaveBeenCalled();
++        });
++
++        test('a selected channel that is visible does not move the list', () => {
++            const {scrollTop, select} = renderInAllMode({top: 200, bottom: 232});
++            select();
++            expect(scrollTop).not.toHaveBeenCalled();
++        });
++
++        test('a selected channel below the visible part is scrolled to', () => {
++            const {scrollTop, select} = renderInAllMode({top: 600, bottom: 632});
++            select();
++            expect(scrollTop).toHaveBeenCalledTimes(1);
++            expect(scrollTop.mock.calls[0][0]).toBeGreaterThanOrEqual(1132);
++        });
++
++        test('a selected channel above the visible part is scrolled to', () => {
++            const {scrollTop, select} = renderInAllMode({top: -300, bottom: -268});
++            select();
++            expect(scrollTop).toHaveBeenCalledTimes(1);
++            expect(scrollTop.mock.calls[0][0]).toBeLessThanOrEqual(600);
++        });
++
++        test('it scrolls once per selection, so manual scrolling sticks', () => {
++            const {scrollTop, select} = renderInAllMode({top: 600, bottom: 632});
++            select();
++            select({hasUnreadThreads: true});
++            expect(scrollTop).toHaveBeenCalledTimes(1);
++        });
++    });
+ });
+diff --git a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
+index d098c0da..5ec3b062 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
++++ b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
+@@ -151,9 +151,11 @@ export class SidebarList extends React.PureComponent<Props, State> {
+     }
+ 
+     unsubscribeAllTeams?: () => void;
++    revealedChannelId = '';
+ 
+     componentDidMount() {
+         this.unsubscribeAllTeams = subscribeAllTeams(() => this.setState({allTeamsMode: isAllTeamsMode()}));
++        this.revealCurrentChannel();
+         document.addEventListener('keydown', this.navigateChannelShortcut);
+         document.addEventListener('keydown', this.navigateUnreadChannelShortcut);
+     }
+@@ -164,13 +166,19 @@ export class SidebarList extends React.PureComponent<Props, State> {
+         document.removeEventListener('keydown', this.navigateUnreadChannelShortcut);
+     }
+ 
+-    componentDidUpdate(prevProps: Props) {
++    componentDidUpdate(prevProps: Props, prevState: State) {
++        if (this.state.allTeamsMode && !prevState.allTeamsMode) {
++            this.revealedChannelId = '';
++        }
++        this.revealCurrentChannel();
++
+         if (!this.props.currentChannelId || !prevProps.currentChannelId) {
+             return;
+         }
+ 
+         // reset the scrollbar upon switching teams
+-        if (this.props.currentTeam !== prevProps.currentTeam) {
++        // PATCH(all-teams): in ALL mode the list stays the same when a click changes the team.
++        if (this.props.currentTeam !== prevProps.currentTeam && !this.state.allTeamsMode) {
+             this.scrollbar.current!.scrollToTop();
+         }
+ 
+@@ -200,11 +208,41 @@ export class SidebarList extends React.PureComponent<Props, State> {
+     setChannelRef = (channelId: string, ref: HTMLLIElement) => {
+         if (ref) {
+             this.channelRefs.set(channelId, ref);
++
++            // The current channel can appear later than its selection: on load, or in a collapsed category.
++            if (channelId === this.props.currentChannelId) {
++                this.revealCurrentChannel();
++            }
+         } else {
+             this.channelRefs.delete(channelId);
+         }
+     };
+ 
++    // PATCH(all-teams): brings the channel selected by a click or by search into view, once per
++    // selection, so scrolling the list by hand afterwards isn't undone. Instant, and a channel that is
++    // already visible doesn't move the list at all.
++    revealCurrentChannel = () => {
++        const channelId = this.props.currentChannelId;
++        const element = this.channelRefs.get(channelId);
++        const scrollbar = this.scrollbar.current;
++        if (!this.state.allTeamsMode || channelId === this.revealedChannelId || !element || !scrollbar) {
++            return;
++        }
++        this.revealedChannelId = channelId;
++
++        // react-custom-scrollbars keeps its outer element in `container`, missing from its typings.
++        const box = (scrollbar as unknown as {container: HTMLElement}).container.getBoundingClientRect();
++        const item = element.getBoundingClientRect();
++        const hiddenAbove = (box.top + categoryHeaderHeight) - item.top;
++        const hiddenBelow = item.bottom - box.bottom;
++
++        if (hiddenAbove > 0) {
++            scrollbar.scrollTop(scrollbar.getScrollTop() - hiddenAbove - scrollMargin);
++        } else if (hiddenBelow > 0) {
++            scrollbar.scrollTop(scrollbar.getScrollTop() + hiddenBelow + scrollMargin);
++        }
++    };
++
+     getFirstUnreadChannelFromChannelIdArray = (channelIds: string[]) => {
+         return channelIds.find((channelId) => {
+             return channelId !== this.props.currentChannelId && this.props.unreadChannelIds.includes(channelId);

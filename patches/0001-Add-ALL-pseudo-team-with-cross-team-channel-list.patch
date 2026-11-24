@@ -1,0 +1,1491 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 3 Nov 2026 11:12:20 +0300
+Subject: [PATCH 01/11] Add ALL pseudo-team with cross-team channel list
+
+A tile in the team sidebar switches the channel sidebar to one list of
+channels from every team plus DMs and GMs, with a mini team icon on each
+channel. Categories, sorting and drag-and-drop order are kept in
+localStorage and synced to /__all_teams_layout when a local server offers it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../all_teams_list/all_teams_list.scss        |  60 ++++
+ .../all_teams_list/all_teams_list.test.tsx    |  75 +++++
+ .../sidebar/all_teams_list/all_teams_list.tsx | 304 ++++++++++++++++++
+ .../sidebar/sidebar_channel/index.ts          |  12 +-
+ .../sidebar_base_channel.tsx                  |  29 +-
+ .../sidebar_channel/sidebar_channel.test.tsx  |   1 +
+ .../sidebar_channel/sidebar_channel.tsx       |   2 +
+ .../sidebar/sidebar_list/sidebar_list.tsx     |  12 +-
+ .../components/team_sidebar/team_sidebar.tsx  |  45 ++-
+ .../src/sass/layout/_sidebar-left.scss        |  19 ++
+ .../src/sass/layout/_team-button.scss         |  10 +
+ .../src/selectors/views/all_teams.test.ts     | 140 ++++++++
+ .../channels/src/selectors/views/all_teams.ts | 138 ++++++++
+ .../channels/src/utils/all_teams_mode.test.ts |  83 +++++
+ webapp/channels/src/utils/all_teams_mode.ts   | 233 ++++++++++++++
+ 15 files changed, 1153 insertions(+), 10 deletions(-)
+ create mode 100644 webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.scss
+ create mode 100644 webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.test.tsx
+ create mode 100644 webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
+ create mode 100644 webapp/channels/src/selectors/views/all_teams.test.ts
+ create mode 100644 webapp/channels/src/selectors/views/all_teams.ts
+ create mode 100644 webapp/channels/src/utils/all_teams_mode.test.ts
+ create mode 100644 webapp/channels/src/utils/all_teams_mode.ts
+
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.scss b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.scss
+new file mode 100644
+index 00000000..d3549a21
+--- /dev/null
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.scss
+@@ -0,0 +1,60 @@
++// PATCH(all-teams)
++.AllTeamsList__newGroup {
++    display: flex;
++    width: 100%;
++    height: 28px;
++    align-items: center;
++    padding: 0 16px 0 19px;
++    border: none;
++    background: transparent;
++    color: rgba(var(--sidebar-text-rgb), 0.64);
++    font-size: 12px;
++    gap: 8px;
++
++    &:hover {
++        color: var(--sidebar-text);
++    }
++}
++
++.AllTeamsList__nameInput {
++    width: calc(100% - 32px);
++    height: 28px;
++    padding: 0 8px;
++    border: 1px solid rgba(var(--sidebar-text-rgb), 0.32);
++    border-radius: 4px;
++    margin: 2px 16px;
++    background: transparent;
++    color: var(--sidebar-text);
++    font-size: 12px;
++}
++
++.AllTeamsList__action {
++    width: 24px;
++    min-width: 24px;
++    height: 24px;
++    padding: 0;
++    border: none;
++    border-radius: 4px;
++    margin-right: 2px;
++    background: transparent;
++    color: rgba(var(--sidebar-text-rgb), 0.64);
++    font-size: 14px;
++    line-height: 14px;
++
++    &:hover {
++        background-color: rgba(255, 255, 255, 0.08);
++        color: var(--sidebar-text);
++    }
++
++    &:last-child {
++        margin-right: 16px;
++    }
++
++    &--onHover {
++        display: none;
++    }
++}
++
++.SidebarChannelGroupHeader:hover .AllTeamsList__action--onHover {
++    display: inline-block;
++}
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.test.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.test.tsx
+new file mode 100644
+index 00000000..64d89203
+--- /dev/null
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.test.tsx
+@@ -0,0 +1,75 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import React from 'react';
++
++import {renderWithContext, screen, userEvent} from 'tests/react_testing_utils';
++import {getAllTeamsLayout, makeDefaultLayout, setAllTeamsLayout} from 'utils/all_teams_mode';
++
++import AllTeamsList from './all_teams_list';
++
++jest.mock('components/sidebar/sidebar_channel', () => ({
++    __esModule: true,
++    default: ({channelId}: {channelId: string}) => <li>{channelId}</li>,
++}));
++
++const channel = {id: 'c1', display_name: 'One', team_id: 't1', type: 'O', delete_at: 0, last_post_at: 1, create_at: 1};
++const state = {
++    entities: {
++        channels: {
++            channels: {c1: channel},
++            myMembers: {c1: {notify_props: {}, mention_count: 0, msg_count: 1}},
++            messageCounts: {c1: {total: 1}},
++            currentChannelId: '',
++        },
++    },
++};
++
++describe('AllTeamsList', () => {
++    beforeEach(() => {
++        window.localStorage.clear();
++        setAllTeamsLayout(makeDefaultLayout());
++    });
++
++    const render = () => renderWithContext(<AllTeamsList setChannelRef={jest.fn()}/>, state as never);
++
++    test('creates, persists and deletes a category', async () => {
++        render();
++        await userEvent.click(screen.getByText('New category'));
++        await userEvent.type(screen.getByPlaceholderText('Category name'), 'Mine{Enter}');
++
++        expect(screen.getByText('Mine')).toBeInTheDocument();
++        expect(JSON.parse(window.localStorage.getItem('mm_all_teams_layout')!).groups.map((g: {name: string}) => g.name)).toEqual(['Mine', 'Channels', 'Direct messages']);
++
++        await userEvent.click(screen.getAllByLabelText('Delete category')[0]);
++        expect(screen.queryByText('Mine')).not.toBeInTheDocument();
++    });
++
++    test('escape cancels creating a category', async () => {
++        render();
++        await userEvent.click(screen.getByText('New category'));
++        await userEvent.type(screen.getByPlaceholderText('Category name'), 'Mine{Escape}');
++        expect(getAllTeamsLayout().groups).toHaveLength(2);
++    });
++
++    test('collapse hides read channels, expand brings them back', async () => {
++        render();
++        expect(screen.getByText('c1')).toBeInTheDocument();
++        await userEvent.click(screen.getByRole('button', {name: 'Channels'}));
++        expect(screen.queryByText('c1')).not.toBeInTheDocument();
++        await userEvent.click(screen.getByRole('button', {name: 'Channels'}));
++        expect(screen.getByText('c1')).toBeInTheDocument();
++    });
++
++    test('renames a category and cycles its sorting', async () => {
++        render();
++        await userEvent.click(screen.getAllByLabelText('Rename category')[0]);
++        const input = screen.getByPlaceholderText('Category name');
++        await userEvent.clear(input);
++        await userEvent.type(input, 'Rest{Enter}');
++        expect(screen.getByText('Rest')).toBeInTheDocument();
++
++        await userEvent.click(screen.getAllByLabelText(/Sorted by recent activity/)[0]);
++        expect(getAllTeamsLayout().groups[0].sorting).toBe('alpha');
++    });
++});
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
+new file mode 100644
+index 00000000..5518b848
+--- /dev/null
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
+@@ -0,0 +1,304 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): the cross-team channel list shown instead of categories in "ALL" mode.
++
++import {DragDropContext, Draggable, Droppable} from '@hello-pangea/dnd';
++import type {BeforeCapture, DropResult} from '@hello-pangea/dnd';
++import classNames from 'classnames';
++import React, {useCallback, useEffect, useMemo, useState} from 'react';
++import {useSelector} from 'react-redux';
++
++import {General} from 'mattermost-redux/constants';
++import {getAllChannels} from 'mattermost-redux/selectors/entities/channels';
++
++import {makeGetAllTeamsGroups} from 'selectors/views/all_teams';
++import type {AllTeamsShownGroup} from 'selectors/views/all_teams';
++
++import {SidebarCategoryHeader} from 'components/sidebar/sidebar_category_header';
++import SidebarChannel from 'components/sidebar/sidebar_channel';
++
++import {
++    addGroup,
++    DEFAULT_GROUP_ID,
++    deleteGroup,
++    DM_GROUP_ID,
++    getAllTeamsLayout,
++    isBuiltInGroup,
++    moveChannel,
++    moveGroup,
++    renameGroup,
++    setAllTeamsLayout,
++    setGroupCollapsed,
++    setGroupSorting,
++    syncAllTeamsLayout,
++    useAllTeamsLayout,
++} from 'utils/all_teams_mode';
++import type {AllTeamsSorting} from 'utils/all_teams_mode';
++import {generateId} from 'utils/utils';
++
++import type {GlobalState} from 'types/store';
++
++import './all_teams_list.scss';
++
++const GROUPS_DROPPABLE_ID = 'all-teams-groups';
++
++const NEXT_SORTING: Record<AllTeamsSorting, AllTeamsSorting> = {manual: 'recency', recency: 'alpha', alpha: 'manual'};
++
++const SORTING_ICONS: Record<AllTeamsSorting, string> = {
++    manual: 'icon-drag-vertical',
++    recency: 'icon-clock-outline',
++    alpha: 'icon-sort-alphabetical-ascending',
++};
++
++const SORTING_TITLES: Record<AllTeamsSorting, string> = {
++    manual: 'Manual order. Click to sort by recent activity',
++    recency: 'Sorted by recent activity. Click to sort A-Z',
++    alpha: 'Sorted A-Z. Click to switch to manual order',
++};
++
++type NameInputProps = {
++    initialValue: string;
++    onDone: (name: string) => void;
++};
++
++function NameInput({initialValue, onDone}: NameInputProps) {
++    const [value, setValue] = useState(initialValue);
++
++    return (
++        <input
++            className='AllTeamsList__nameInput'
++            autoFocus={true}
++            placeholder='Category name'
++            value={value}
++            onChange={(e) => setValue(e.target.value)}
++            onBlur={() => onDone(value.trim())}
++            onKeyDown={(e) => {
++                // Keeps the sidebar's arrow-key navigation out of the text field.
++                e.stopPropagation();
++                if (e.key === 'Enter') {
++                    onDone(value.trim());
++                } else if (e.key === 'Escape') {
++                    onDone('');
++                }
++            }}
++        />
++    );
++}
++
++type Props = {
++    setChannelRef: (channelId: string, ref: HTMLLIElement) => void;
++};
++
++export default function AllTeamsList({setChannelRef}: Props) {
++    const layout = useAllTeamsLayout();
++    const getGroups = useMemo(() => makeGetAllTeamsGroups(), []);
++    const groups = useSelector((state: GlobalState) => getGroups(state, layout));
++    const allChannels = useSelector(getAllChannels);
++
++    useEffect(() => {
++        syncAllTeamsLayout();
++    }, []);
++
++    const [isCreating, setIsCreating] = useState(false);
++    const [editingId, setEditingId] = useState('');
++    const [draggedGroupId, setDraggedGroupId] = useState('');
++    const [draggedKind, setDraggedKind] = useState<'dm' | 'channel' | ''>('');
++
++    const onBeforeCapture = (before: BeforeCapture) => {
++        const dragged = allChannels[before.draggableId];
++        if (dragged) {
++            setDraggedKind(dragged.type === General.DM_CHANNEL || dragged.type === General.GM_CHANNEL ? 'dm' : 'channel');
++        }
++
++        // A group is dragged with its channels hidden, like a native category. The drag library needs
++        // the scroll box to keep its height while it measures that smaller layout.
++        if (getAllTeamsLayout().groups.some((group) => group.id === before.draggableId)) {
++            const list = document.getElementById(GROUPS_DROPPABLE_ID);
++            if (list) {
++                list.style.height = `${list.scrollHeight}px`;
++            }
++            setDraggedGroupId(before.draggableId);
++        }
++    };
++
++    const onDragStart = useCallback(() => {
++        const list = document.getElementById(GROUPS_DROPPABLE_ID);
++        if (list) {
++            list.style.height = '';
++        }
++    }, []);
++
++    const onDragEnd = (result: DropResult) => {
++        setDraggedGroupId('');
++        setDraggedKind('');
++
++        if (result.reason !== 'DROP' || !result.destination) {
++            return;
++        }
++
++        const {droppableId, index} = result.destination;
++        if (result.type === 'SIDEBAR_CATEGORY') {
++            setAllTeamsLayout(moveGroup(layout, result.draggableId, index));
++        } else {
++            const shownIds = groups.find(({group}) => group.id === droppableId)?.shownIds ?? [];
++            setAllTeamsLayout(moveChannel(layout, result.draggableId, droppableId, index, shownIds));
++        }
++    };
++
++    const finishCreating = (name: string) => {
++        setIsCreating(false);
++        if (name) {
++            setAllTeamsLayout(addGroup(layout, generateId(), name));
++        }
++    };
++
++    const finishRenaming = (groupId: string, name: string) => {
++        setEditingId('');
++        if (name) {
++            setAllTeamsLayout(renameGroup(layout, groupId, name));
++        }
++    };
++
++    const renderGroup = ({group, shownIds}: AllTeamsShownGroup, groupIndex: number) => {
++        const isEditing = editingId === group.id;
++        const isDragged = draggedGroupId === group.id;
++
++        return (
++            <Draggable
++                key={group.id}
++                draggableId={group.id}
++                index={groupIndex}
++                isDragDisabled={isEditing}
++                disableInteractiveElementBlocking={true}
++            >
++                {(provided, snapshot) => (
++                    <div
++                        className={classNames('SidebarChannelGroup a11y__section', {isCollapsed: group.collapsed})}
++                        ref={provided.innerRef}
++                        {...provided.draggableProps}
++                    >
++                        <Droppable
++                            droppableId={group.id}
++                            type='SIDEBAR_CHANNEL'
++
++                            // DMs and channels only mix in custom categories, as in native ones.
++                            isDropDisabled={(group.id === DM_GROUP_ID && draggedKind === 'channel') || (group.id === DEFAULT_GROUP_ID && draggedKind === 'dm')}
++                        >
++                            {(droppableProvided, droppableSnapshot) => (
++                                <div
++                                    {...droppableProvided.droppableProps}
++                                    ref={droppableProvided.innerRef}
++                                    className={classNames({draggingOver: droppableSnapshot.isDraggingOver})}
++                                >
++                                    {isEditing ? (
++                                        <NameInput
++                                            initialValue={group.name}
++                                            onDone={(name) => finishRenaming(group.id, name)}
++                                        />
++                                    ) : (
++                                        <SidebarCategoryHeader
++                                            displayName={group.name}
++                                            dragHandleProps={provided.dragHandleProps}
++                                            isCollapsed={group.collapsed}
++                                            isCollapsible={true}
++                                            isDragging={snapshot.isDragging}
++                                            isDraggingOver={droppableSnapshot.isDraggingOver}
++                                            muted={false}
++                                            onClick={() => setAllTeamsLayout(setGroupCollapsed(layout, group.id, !group.collapsed))}
++                                        >
++                                            <button
++                                                className='AllTeamsList__action AllTeamsList__action--onHover'
++                                                title='Rename category'
++                                                aria-label='Rename category'
++                                                onClick={() => setEditingId(group.id)}
++                                            >
++                                                <i className='icon icon-pencil-outline'/>
++                                            </button>
++                                            {!isBuiltInGroup(group.id) && (
++                                                <button
++                                                    className='AllTeamsList__action AllTeamsList__action--onHover'
++                                                    title='Delete category. Its channels go back to Channels and Direct messages'
++                                                    aria-label='Delete category'
++                                                    onClick={() => setAllTeamsLayout(deleteGroup(layout, group.id))}
++                                                >
++                                                    <i className='icon icon-trash-can-outline'/>
++                                                </button>
++                                            )}
++                                            <button
++                                                className='AllTeamsList__action'
++                                                title={SORTING_TITLES[group.sorting]}
++                                                aria-label={SORTING_TITLES[group.sorting]}
++                                                onClick={() => setAllTeamsLayout(setGroupSorting(layout, group.id, NEXT_SORTING[group.sorting]))}
++                                            >
++                                                <i className={`icon ${SORTING_ICONS[group.sorting]}`}/>
++                                            </button>
++                                        </SidebarCategoryHeader>
++                                    )}
++                                    <div className='SidebarChannelGroup_content'>
++                                        <ul className='NavGroupContent'>
++                                            {!isDragged && shownIds.map((channelId, index) => (
++                                                <SidebarChannel
++                                                    key={channelId}
++                                                    channelId={channelId}
++                                                    channelIndex={index}
++                                                    isCategoryCollapsed={false}
++                                                    isCategoryDragged={false}
++                                                    isDraggable={true}
++                                                    isAutoSortedCategory={false}
++                                                    setChannelRef={setChannelRef}
++                                                    alwaysShowTeam={true}
++                                                />
++                                            ))}
++                                            {droppableProvided.placeholder}
++                                        </ul>
++                                    </div>
++                                </div>
++                            )}
++                        </Droppable>
++                    </div>
++                )}
++            </Draggable>
++        );
++    };
++
++    return (
++        <>
++            {isCreating ? (
++                <NameInput
++                    initialValue=''
++                    onDone={finishCreating}
++                />
++            ) : (
++                <button
++                    className='AllTeamsList__newGroup'
++                    onClick={() => setIsCreating(true)}
++                >
++                    <i className='icon icon-plus'/>
++                    {'New category'}
++                </button>
++            )}
++            <DragDropContext
++                onBeforeCapture={onBeforeCapture}
++                onDragStart={onDragStart}
++                onDragEnd={onDragEnd}
++            >
++                <Droppable
++                    droppableId='droppable-all-teams-groups'
++                    type='SIDEBAR_CATEGORY'
++                >
++                    {(provided) => (
++                        <div
++                            id={GROUPS_DROPPABLE_ID}
++                            ref={provided.innerRef}
++                            {...provided.droppableProps}
++                        >
++                            {groups.map(renderGroup)}
++                            {provided.placeholder}
++                        </div>
++                    )}
++                </Droppable>
++            </DragDropContext>
++        </>
++    );
++}
+diff --git a/webapp/channels/src/components/sidebar/sidebar_channel/index.ts b/webapp/channels/src/components/sidebar/sidebar_channel/index.ts
+index 0697a2a1..abd9d260 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_channel/index.ts
++++ b/webapp/channels/src/components/sidebar/sidebar_channel/index.ts
+@@ -5,7 +5,7 @@ import {connect} from 'react-redux';
+ import type {ConnectedProps} from 'react-redux';
+ 
+ import {getCurrentChannelId, makeGetChannel, makeGetChannelUnreadCount} from 'mattermost-redux/selectors/entities/channels';
+-import {getCurrentTeam} from 'mattermost-redux/selectors/entities/teams';
++import {getCurrentTeam, getTeam} from 'mattermost-redux/selectors/entities/teams';
+ 
+ import {getAutoSortedCategoryIds, getDraggingState, isChannelSelected} from 'selectors/views/channel_sidebar';
+ 
+@@ -21,6 +21,9 @@ type OwnProps = {
+     isDraggable: boolean;
+     isAutoSortedCategory: boolean;
+ 
++    // PATCH(all-teams): show the team badge even for channels of the current team (flat ALL list).
++    alwaysShowTeam?: boolean;
++
+     /**
+      * Sets the ref for the sidebar channel div element, so that it can be used by parent components
+      */
+@@ -39,10 +42,15 @@ function makeMapStateToProps() {
+ 
+         const unreadCount = getUnreadCount(state, channel?.id || '');
+ 
++        // PATCH(all-teams): channels listed from another team link into that team and show its icon.
++        const showTeam = channel?.team_id && (ownProps.alwaysShowTeam || channel.team_id !== currentTeam?.id);
++        const otherTeam = showTeam ? getTeam(state, channel!.team_id) : undefined;
++
+         return {
+             channel,
+             isCurrentChannel: channel?.id === currentChannelId,
+-            currentTeamName: currentTeam?.name,
++            currentTeamName: otherTeam?.name ?? currentTeam?.name,
++            otherTeam,
+             unreadMentions: unreadCount.mentions,
+             isUnread: unreadCount.showUnread,
+             draggingState: getDraggingState(state),
+diff --git a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_base_channel/sidebar_base_channel.tsx b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_base_channel/sidebar_base_channel.tsx
+index c11bf998..de2ae1bf 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_base_channel/sidebar_base_channel.tsx
++++ b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_base_channel/sidebar_base_channel.tsx
+@@ -5,6 +5,7 @@ import React, {useCallback} from 'react';
+ import {useIntl} from 'react-intl';
+ 
+ import type {Channel} from '@mattermost/types/channels';
++import type {Team} from '@mattermost/types/teams';
+ 
+ import {trackEvent} from 'actions/telemetry_actions';
+ 
+@@ -12,6 +13,7 @@ import LeaveChannelModal from 'components/leave_channel_modal';
+ import SidebarChannelLink from 'components/sidebar/sidebar_channel/sidebar_channel_link';
+ 
+ import Constants, {ModalIdentifiers} from 'utils/constants';
++import {imageURLForTeam} from 'utils/utils';
+ 
+ import SidebarBaseChannelIcon from './sidebar_base_channel_icon';
+ 
+@@ -20,11 +22,15 @@ import type {PropsFromRedux} from './index';
+ export interface Props extends PropsFromRedux {
+     channel: Channel;
+     currentTeamName: string;
++
++    // PATCH(all-teams): set when the channel belongs to a team other than the current one.
++    team?: Team;
+ }
+ 
+ const SidebarBaseChannel = ({
+     channel,
+     currentTeamName,
++    team,
+     actions,
+ }: Props) => {
+     const intl = useIntl();
+@@ -48,10 +54,27 @@ const SidebarBaseChannel = ({
+         channelLeaveHandler = handleLeavePrivateChannel;
+     }
+ 
++    let teamBadge = null;
++    if (team) {
++        const iconUrl = imageURLForTeam(team);
++        teamBadge = (
++            <span
++                className='SidebarChannelTeamBadge'
++                title={team.display_name}
++                style={iconUrl ? {backgroundImage: `url('${iconUrl}')`} : undefined}
++            >
++                {iconUrl ? null : team.display_name.replace(/\s/g, '').substring(0, 2)}
++            </span>
++        );
++    }
++
+     const channelIcon = (
+-        <SidebarBaseChannelIcon
+-            channelType={channel.type}
+-        />
++        <>
++            <SidebarBaseChannelIcon
++                channelType={channel.type}
++            />
++            {teamBadge}
++        </>
+     );
+ 
+     let ariaLabelPrefix;
+diff --git a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.test.tsx b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.test.tsx
+index 7c8805c4..cf195ef6 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.test.tsx
++++ b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.test.tsx
+@@ -31,6 +31,7 @@ describe('components/sidebar/sidebar_channel', () => {
+         isDraggable: false,
+         channelIndex: 0,
+         currentTeamName: 'team_name',
++        otherTeam: undefined,
+         unreadMentions: 0,
+         isUnread: false,
+         setChannelRef: jest.fn(),
+diff --git a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.tsx b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.tsx
+index 11736a61..b5351aab 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.tsx
++++ b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel.tsx
+@@ -23,6 +23,7 @@ function SidebarChannel({
+     setChannelRef,
+     channel,
+     currentTeamName,
++    otherTeam,
+     isDraggable,
+     isChannelSelected,
+     draggingState,
+@@ -85,6 +86,7 @@ function SidebarChannel({
+             <SidebarBaseChannel
+                 channel={channel}
+                 currentTeamName={currentTeamName}
++                team={otherTeam}
+             />
+         );
+     }
+diff --git a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
+index a854d7b5..d098c0da 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
++++ b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
+@@ -21,8 +21,10 @@ import {General} from 'mattermost-redux/constants';
+ import {trackEvent} from 'actions/telemetry_actions';
+ 
+ import {makeAsyncComponent} from 'components/async_load';
++import AllTeamsList from 'components/sidebar/all_teams_list/all_teams_list';
+ import SidebarCategory from 'components/sidebar/sidebar_category';
+ 
++import {isAllTeamsMode, subscribeAllTeams} from 'utils/all_teams_mode';
+ import {findNextUnreadChannelId} from 'utils/channel_utils';
+ import {Constants, DraggingStates, DraggingStateTypes} from 'utils/constants';
+ import {isKeyPressed, cmdOrCtrlPressed} from 'utils/keyboard';
+@@ -110,6 +112,7 @@ type State = {
+     showTopUnread: boolean;
+     showBottomUnread: boolean;
+     autoHide: boolean;
++    allTeamsMode: boolean;
+ };
+ 
+ // scrollMargin is the margin at the edge of the channel list that we leave when scrolling to a channel.
+@@ -137,6 +140,7 @@ export class SidebarList extends React.PureComponent<Props, State> {
+             showTopUnread: false,
+             showBottomUnread: false,
+             autoHide: true,
++            allTeamsMode: isAllTeamsMode(),
+         };
+         this.scrollbar = React.createRef();
+ 
+@@ -146,12 +150,16 @@ export class SidebarList extends React.PureComponent<Props, State> {
+         this.scrollAnimation.addListener({onSpringUpdate: this.handleScrollAnimationUpdate});
+     }
+ 
++    unsubscribeAllTeams?: () => void;
++
+     componentDidMount() {
++        this.unsubscribeAllTeams = subscribeAllTeams(() => this.setState({allTeamsMode: isAllTeamsMode()}));
+         document.addEventListener('keydown', this.navigateChannelShortcut);
+         document.addEventListener('keydown', this.navigateUnreadChannelShortcut);
+     }
+ 
+     componentWillUnmount() {
++        this.unsubscribeAllTeams?.();
+         document.removeEventListener('keydown', this.navigateChannelShortcut);
+         document.removeEventListener('keydown', this.navigateUnreadChannelShortcut);
+     }
+@@ -484,7 +492,9 @@ export class SidebarList extends React.PureComponent<Props, State> {
+         const {categories} = this.props;
+ 
+         let channelList: React.ReactNode;
+-        if (this.props.isUnreadFilterEnabled) {
++        if (this.state.allTeamsMode) {
++            channelList = <AllTeamsList setChannelRef={this.setChannelRef}/>;
++        } else if (this.props.isUnreadFilterEnabled) {
+             channelList = (
+                 <UnreadChannels
+                     setChannelRef={this.setChannelRef}
+diff --git a/webapp/channels/src/components/team_sidebar/team_sidebar.tsx b/webapp/channels/src/components/team_sidebar/team_sidebar.tsx
+index d17ab523..dabd9449 100644
+--- a/webapp/channels/src/components/team_sidebar/team_sidebar.tsx
++++ b/webapp/channels/src/components/team_sidebar/team_sidebar.tsx
+@@ -19,6 +19,7 @@ import TeamButton from 'components/team_sidebar/components/team_button';
+ 
+ import WebSocketClient from 'client/web_websocket_client';
+ import Pluggable from 'plugins/pluggable';
++import {isAllTeamsMode, setAllTeamsMode, subscribeAllTeams} from 'utils/all_teams_mode';
+ import {Constants} from 'utils/constants';
+ import * as Keyboard from 'utils/keyboard';
+ import {getCurrentProduct} from 'utils/products';
+@@ -34,6 +35,7 @@ export interface Props extends PropsFromRedux, WrappedComponentProps {
+ type State = {
+     showOrder: boolean;
+     teamsOrder: Team[];
++    allTeamsMode: boolean;
+ }
+ 
+ export function renderView(props: Props) {
+@@ -70,9 +72,18 @@ export class TeamSidebar extends React.PureComponent<Props, State> {
+         this.state = {
+             showOrder: false,
+             teamsOrder: [],
++            allTeamsMode: isAllTeamsMode(),
+         };
+     }
+ 
++    unsubscribeAllTeams?: () => void;
++
++    // PATCH(all-teams): every switch to a real team (click or keyboard) leaves ALL mode.
++    switchTeamTo = (url: string, team?: Team) => {
++        setAllTeamsMode(false);
++        this.props.actions.switchTeam(url, team);
++    };
++
+     switchToPrevOrNextTeam = (e: KeyboardEvent, currentTeamId: string, teams: Team[]) => {
+         if (Keyboard.isKeyPressed(e, Constants.KeyCodes.UP) || Keyboard.isKeyPressed(e, Constants.KeyCodes.DOWN)) {
+             e.preventDefault();
+@@ -89,7 +100,7 @@ export class TeamSidebar extends React.PureComponent<Props, State> {
+                 team = teams[newPos];
+             }
+ 
+-            this.props.actions.switchTeam(`/${team.name}`);
++            this.switchTeamTo(`/${team.name}`);
+             return true;
+         }
+         return false;
+@@ -118,7 +129,7 @@ export class TeamSidebar extends React.PureComponent<Props, State> {
+                     return false;
+                 }
+                 const team = teams[idx];
+-                this.props.actions.switchTeam(`/${team.name}`);
++                this.switchTeamTo(`/${team.name}`);
+                 return true;
+             }
+         }
+@@ -157,11 +168,13 @@ export class TeamSidebar extends React.PureComponent<Props, State> {
+ 
+     componentDidMount() {
+         this.props.actions.getTeams(0, 200);
++        this.unsubscribeAllTeams = subscribeAllTeams(() => this.setState({allTeamsMode: isAllTeamsMode()}));
+         document.addEventListener('keydown', this.handleKeyDown);
+         document.addEventListener('keyup', this.handleKeyUp);
+     }
+ 
+     componentWillUnmount() {
++        this.unsubscribeAllTeams?.();
+         document.removeEventListener('keydown', this.handleKeyDown);
+         document.removeEventListener('keyup', this.handleKeyUp);
+     }
+@@ -225,7 +238,7 @@ export class TeamSidebar extends React.PureComponent<Props, State> {
+                     key={'switch_team_' + team.name}
+                     url={`/${team.name}`}
+                     tip={team.display_name}
+-                    active={team.id === this.props.currentTeamId}
++                    active={team.id === this.props.currentTeamId && !this.state.allTeamsMode}
+                     displayName={team.display_name}
+                     order={index + 1}
+                     showOrder={this.state.showOrder}
+@@ -233,7 +246,7 @@ export class TeamSidebar extends React.PureComponent<Props, State> {
+                     mentions={this.props.mentionsInTeamMap.has(team.id) ? this.props.mentionsInTeamMap.get(team.id) : 0}
+                     hasUrgent={this.props.teamHasUrgentMap.has(team.id) ? this.props.teamHasUrgentMap.get(team.id) : false}
+                     teamIconUrl={Utils.imageURLForTeam(team)}
+-                    switchTeam={(url: string) => this.props.actions.switchTeam(url, currentProduct ? team : undefined)}
++                    switchTeam={(url: string) => this.switchTeamTo(url, currentProduct ? team : undefined)}
+                     isDraggable={true}
+                     teamId={team.id}
+                     teamIndex={index}
+@@ -242,6 +255,29 @@ export class TeamSidebar extends React.PureComponent<Props, State> {
+             );
+         });
+ 
++        // PATCH(all-teams): pseudo-team that shows every team's channels as one list.
++        let allTeamsMentions = 0;
++        this.props.mentionsInTeamMap.forEach((count) => {
++            allTeamsMentions += count || 0;
++        });
++        const allTeamsButton = (
++            <div className='all-teams-container'>
++                <TeamButton
++                    key='all_teams'
++                    btnClass='team-btn__all'
++                    url='/all_teams'
++                    tip='All teams'
++                    displayName='All teams'
++                    content={<i className='icon icon-format-list-bulleted'/>}
++                    active={this.state.allTeamsMode}
++                    unread={this.props.unreadTeamsSet.size > 0}
++                    mentions={allTeamsMentions}
++                    switchTeam={() => setAllTeamsMode(true)}
++                    isInProduct={Boolean(currentProduct)}
++                />
++            </div>
++        );
++
+         const joinableTeams = [];
+ 
+         const plusIcon = (
+@@ -329,6 +365,7 @@ export class TeamSidebar extends React.PureComponent<Props, State> {
+                         renderThumbVertical={renderThumbVertical}
+                         renderView={renderView}
+                     >
++                        {allTeamsButton}
+                         <DragDropContext
+                             onDragEnd={this.onDragEnd}
+                         >
+diff --git a/webapp/channels/src/sass/layout/_sidebar-left.scss b/webapp/channels/src/sass/layout/_sidebar-left.scss
+index fa10133a..ea87a4df 100644
+--- a/webapp/channels/src/sass/layout/_sidebar-left.scss
++++ b/webapp/channels/src/sass/layout/_sidebar-left.scss
+@@ -1114,6 +1114,25 @@ $sidebarOpacityAnimationDuration: 0.15s;
+         font-size: 14px;
+         text-decoration: none;
+ 
++        // PATCH(all-teams): mini team icon next to the channel icon for channels from other teams.
++        .SidebarChannelTeamBadge {
++            display: inline-flex;
++            width: 16px;
++            height: 16px;
++            flex-shrink: 0;
++            align-items: center;
++            justify-content: center;
++            margin-right: 6px;
++            border-radius: 4px;
++            background-color: rgba(var(--sidebar-text-rgb), 0.16);
++            background-position: center;
++            background-size: cover;
++            font-size: 8px;
++            font-weight: 600;
++            line-height: 1;
++            text-transform: uppercase;
++        }
++
+         .emoji {
+             color: var(--sidebar-text);
+         }
+diff --git a/webapp/channels/src/sass/layout/_team-button.scss b/webapp/channels/src/sass/layout/_team-button.scss
+index 473f69b4..046e2c29 100644
+--- a/webapp/channels/src/sass/layout/_team-button.scss
++++ b/webapp/channels/src/sass/layout/_team-button.scss
+@@ -1,3 +1,7 @@
++.all-teams-container {
++    margin-bottom: 12px; // PATCH(all-teams): same gap as between real teams
++}
++
+ .team-btn {
+     position: relative;
+     border-radius: 8px;
+@@ -7,6 +11,12 @@
+     text-transform: capitalize;
+     vertical-align: top;
+ 
++    // PATCH(all-teams): the ALL pseudo-team tile.
++    &.team-btn__all .icon {
++        font-size: 22px;
++        line-height: 1;
++    }
++
+     &.team-btn__add {
+         font-size: 25px;
+         line-height: 41px;
+diff --git a/webapp/channels/src/selectors/views/all_teams.test.ts b/webapp/channels/src/selectors/views/all_teams.test.ts
+new file mode 100644
+index 00000000..78162504
+--- /dev/null
++++ b/webapp/channels/src/selectors/views/all_teams.test.ts
+@@ -0,0 +1,140 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import {addGroup, deleteGroup, makeDefaultLayout, moveChannel, moveGroup, parseLayout, setGroupCollapsed, setGroupSorting} from 'utils/all_teams_mode';
++import type {AllTeamsLayout} from 'utils/all_teams_mode';
++import {TestHelper} from 'utils/test_helper';
++
++import type {GlobalState} from 'types/store';
++
++import {makeGetAllTeamsGroups} from './all_teams';
++
++const channel = (id: string, displayName: string, lastPostAt: number, teamId = 't1') => TestHelper.getChannelMock({id, display_name: displayName, last_post_at: lastPostAt, team_id: teamId, type: 'O', delete_at: 0});
++
++const channels = {
++    a: channel('a', 'Alpha', 100),
++    b: channel('b', 'Bravo', 300, 't2'),
++    c: channel('c', 'Charlie', 200, 't3'),
++    notMine: channel('notMine', 'Not mine', 900),
++    dm1: {...channel('dm1', '', 500, ''), type: 'D' as const, name: 'me__zoe'},
++    dm2: {...channel('dm2', '', 400, ''), type: 'D' as const, name: 'me__adam'},
++    closedDm: {...channel('closedDm', '', 900, ''), type: 'D' as const, name: 'me__gone'},
++};
++const member = (msgCount: number) => ({notify_props: {}, mention_count: 0, mention_count_root: 0, msg_count: msgCount, msg_count_root: msgCount});
++
++const state = {
++    entities: {
++        channels: {
++            channels,
++            currentChannelId: 'a',
++            channelsInTeam: {'': new Set(['dm1', 'dm2', 'closedDm'])},
++            messageCounts: {a: {total: 1, root: 1}, b: {total: 1, root: 1}, c: {total: 5, root: 5}, dm1: {total: 9, root: 9}, dm2: {total: 1, root: 1}, closedDm: {total: 1, root: 1}},
++            myMembers: {a: member(1), b: member(1), c: member(1), dm1: member(1), dm2: member(1), closedDm: member(1)},
++        },
++        general: {config: {}},
++        preferences: {myPreferences: {
++            'direct_channel_show--gone': {value: 'false'},
++            'direct_channel_show--zoe': {value: 'true'},
++            'direct_channel_show--adam': {value: 'true'},
++        }},
++        users: {
++            currentUserId: 'me',
++            profiles: {me: {locale: 'en'}, zoe: {id: 'zoe', username: 'zoe'}, adam: {id: 'adam', username: 'adam'}, gone: {id: 'gone', username: 'gone'}},
++            statuses: {},
++            isManualStatus: {},
++        },
++    },
++    views: {},
++} as unknown as GlobalState;
++
++const allShown = (layout: AllTeamsLayout) => makeGetAllTeamsGroups()(state, layout).map(({group, shownIds}) => [group.id, shownIds]);
++const shown = (layout: AllTeamsLayout) => allShown(layout).filter(([id]) => id !== 'dms');
++
++describe('ALL pseudo-team layout', () => {
++    const base = makeDefaultLayout();
++
++    test('lists my channels from every team, without DMs or channels I left', () => {
++        expect(shown(base)).toEqual([['default', ['b', 'c', 'a']]]);
++    });
++
++    test('sorts A-Z', () => {
++        expect(shown(setGroupSorting(base, 'default', 'alpha'))).toEqual([['default', ['a', 'b', 'c']]]);
++    });
++
++    test('a drop pins the shown order and survives a JSON round trip', () => {
++        const moved = moveChannel(base, 'a', 'default', 0, ['b', 'c', 'a']);
++        expect(moved.groups[0].sorting).toBe('manual');
++        expect(shown(parseLayout(JSON.stringify(moved)))).toEqual([['default', ['a', 'b', 'c']]]);
++    });
++
++    test('a channel dropped into a category leaves the default group', () => {
++        const withGroup = addGroup(base, 'g', 'Mine');
++        expect(shown(moveChannel(withGroup, 'c', 'g', 0, []))).toEqual([['g', ['c']], ['default', ['b', 'a']]]);
++    });
++
++    test('moving between categories leaves no duplicate', () => {
++        let layout = addGroup(addGroup(base, 'g1', 'One'), 'g2', 'Two');
++        layout = moveChannel(layout, 'c', 'g1', 0, []);
++        layout = moveChannel(layout, 'c', 'g2', 0, []);
++        expect(shown(layout)).toEqual([['g2', ['c']], ['g1', []], ['default', ['b', 'a']]]);
++    });
++
++    test('a newly joined channel lands on top of a manual default group', () => {
++        const layout = moveChannel(base, 'a', 'default', 0, ['a', 'b']);
++        expect(shown(layout)).toEqual([['default', ['c', 'a', 'b']]]);
++    });
++
++    test('collapsed shows only unread and current channels', () => {
++        expect(shown(setGroupCollapsed(base, 'default', true))).toEqual([['default', ['a']]]);
++    });
++
++    test('collapsed hides unread DMs too', () => {
++        expect(allShown(setGroupCollapsed(base, 'dms', true))).toContainEqual(['dms', []]);
++    });
++
++    test('open DMs get their own group, closed ones stay out', () => {
++        expect(allShown(base)).toEqual([['default', ['b', 'c', 'a']], ['dms', ['dm1', 'dm2']]]);
++    });
++
++    test('sorts DMs A-Z by teammate name', () => {
++        expect(allShown(setGroupSorting(base, 'dms', 'alpha'))).toContainEqual(['dms', ['dm2', 'dm1']]);
++    });
++
++    test('a DM moved to a category leaves the DM group and returns when it is deleted', () => {
++        const layout = moveChannel(addGroup(base, 'g', 'Mine'), 'dm1', 'g', 0, []);
++        expect(allShown(layout)).toEqual([['g', ['dm1']], ['default', ['b', 'c', 'a']], ['dms', ['dm2']]]);
++        expect(allShown(deleteGroup(layout, 'g'))).toContainEqual(['dms', ['dm1', 'dm2']]);
++    });
++
++    test('a manual DM order survives and a new DM lands on top', () => {
++        const layout = moveChannel(base, 'dm2', 'dms', 0, ['dm2']);
++        expect(allShown(layout)).toContainEqual(['dms', ['dm1', 'dm2']]);
++    });
++
++    test('a layout saved before DMs gets the group', () => {
++        const old = JSON.stringify({groups: [{id: 'default', name: 'Channels', collapsed: false, sorting: 'manual', channelIds: ['a']}]});
++        expect(parseLayout(old).groups.map((g) => g.id)).toEqual(['default', 'dms']);
++    });
++
++    test('a drop into a collapsed category keeps its hidden channels', () => {
++        const layout = moveChannel({groups: [{...base.groups[0], channelIds: ['a', 'b']}]}, 'c', 'default', 0, ['a']);
++        expect(layout.groups[0].channelIds).toEqual(['c', 'a', 'b']);
++    });
++
++    test('deleting a category returns its channels, the default group stays', () => {
++        const layout = moveChannel(addGroup(base, 'g', 'Mine'), 'c', 'g', 0, []);
++        expect(shown(deleteGroup(layout, 'g'))).toEqual([['default', ['b', 'c', 'a']]]);
++        expect(deleteGroup(base, 'default')).toBe(base);
++        expect(deleteGroup(base, 'dms')).toBe(base);
++    });
++
++    test('reorders categories', () => {
++        expect(moveGroup(addGroup(base, 'g', 'Mine'), 'g', 1).groups.map((g) => g.id)).toEqual(['default', 'g', 'dms']);
++    });
++
++    test('corrupt storage falls back to the default layout', () => {
++        expect(parseLayout('{oops')).toEqual(base);
++        expect(parseLayout(null)).toEqual(base);
++        expect(parseLayout('{"groups":[]}')).toEqual(base);
++    });
++});
+diff --git a/webapp/channels/src/selectors/views/all_teams.ts b/webapp/channels/src/selectors/views/all_teams.ts
+new file mode 100644
+index 00000000..c07cb2a7
+--- /dev/null
++++ b/webapp/channels/src/selectors/views/all_teams.ts
+@@ -0,0 +1,138 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): lays out the user's channels from every team, plus their DMs and GMs, into the
++// groups of the ALL pseudo-team.
++
++import type {ChannelCategory} from '@mattermost/types/channel_categories';
++import {CategorySorting} from '@mattermost/types/channel_categories';
++import type {Channel} from '@mattermost/types/channels';
++
++import {General} from 'mattermost-redux/constants';
++import {CategoryTypes} from 'mattermost-redux/constants/channel_categories';
++import {createSelector} from 'mattermost-redux/selectors/create_selector';
++import {makeFilterAndSortChannelsForCategory} from 'mattermost-redux/selectors/entities/channel_categories';
++import {getAllChannels, getAllDirectChannels, getChannelMessageCounts, getCurrentChannelId, getMyChannelMemberships} from 'mattermost-redux/selectors/entities/channels';
++import {getCurrentUserLocale} from 'mattermost-redux/selectors/entities/i18n';
++import {isCollapsedThreadsEnabled, shouldShowUnreadsCategory} from 'mattermost-redux/selectors/entities/preferences';
++import {calculateUnreadCount} from 'mattermost-redux/utils/channel_utils';
++
++import {DEFAULT_GROUP_ID, DM_GROUP_ID} from 'utils/all_teams_mode';
++import type {AllTeamsGroup, AllTeamsLayout} from 'utils/all_teams_mode';
++
++import type {GlobalState} from 'types/store';
++
++export type AllTeamsShownGroup = {
++    group: AllTeamsGroup;
++
++    // In display order. A collapsed group only shows the current channel.
++    shownIds: string[];
++};
++
++// Native filtering decides which DMs are open: the "direct messages" type also applies the limit on
++// how many stay visible, which natively spares DMs that were placed in a custom category.
++const DM_CATEGORY = {type: CategoryTypes.DIRECT_MESSAGES, sorting: CategorySorting.Recency} as ChannelCategory;
++const CUSTOM_CATEGORY = {type: CategoryTypes.CUSTOM, sorting: CategorySorting.Recency} as ChannelCategory;
++
++export function makeGetAllTeamsGroups(): (state: GlobalState, layout: AllTeamsLayout) => AllTeamsShownGroup[] {
++    const filterOpenDms = makeFilterAndSortChannelsForCategory();
++    const filterDmGroup = makeFilterAndSortChannelsForCategory();
++
++    const getMyDms = createSelector(
++        'getAllTeamsMyDms',
++        (state: GlobalState) => getAllDirectChannels(state),
++        (state: GlobalState) => getMyChannelMemberships(state),
++        (dms, myMembers) => dms.filter((dm) => Object.hasOwn(myMembers, dm.id)),
++    );
++
++    const getUnclaimedDms = createSelector(
++        'getAllTeamsUnclaimedDms',
++        (state: GlobalState) => getMyDms(state),
++        (_: GlobalState, layout: AllTeamsLayout) => layout,
++        (dms, layout) => {
++            const claimed = new Set(layout.groups.filter((group) => group.id !== DM_GROUP_ID).flatMap((group) => group.channelIds));
++            return dms.filter((dm) => !claimed.has(dm.id));
++        },
++    );
++
++    const getGroups = createSelector(
++        'getAllTeamsGroups',
++        (state: GlobalState) => getAllChannels(state),
++        (state: GlobalState) => getMyChannelMemberships(state),
++        (state: GlobalState) => getChannelMessageCounts(state),
++        (state: GlobalState) => getCurrentChannelId(state),
++        (state: GlobalState) => isCollapsedThreadsEnabled(state),
++        (state: GlobalState) => shouldShowUnreadsCategory(state),
++        (state: GlobalState) => getCurrentUserLocale(state),
++        (_: GlobalState, layout: AllTeamsLayout) => layout,
++        (_: GlobalState, _layout: AllTeamsLayout, openDms: Channel[]) => openDms,
++        (_: GlobalState, _layout: AllTeamsLayout, _openDms: Channel[], dmGroupDms: Channel[]) => dmGroupDms,
++        (allChannels, myMembers, messageCounts, currentChannelId, crtEnabled, unreadsFirst, locale, layout, openDms, dmGroupDms) => {
++            // DMs come with their display name filled in, which the raw channels don't have.
++            const channelsById: Record<string, Channel> = {...allChannels};
++            openDms.forEach((dm) => {
++                channelsById[dm.id] = dm;
++            });
++            const openDmIds = new Set(openDms.map((dm) => dm.id));
++            const dmGroupIds = dmGroupDms.map((dm) => dm.id);
++
++            const isListed = (channel?: Channel) => Boolean(
++                channel &&
++                (openDmIds.has(channel.id) || (
++                    (channel.type === General.OPEN_CHANNEL || channel.type === General.PRIVATE_CHANNEL) &&
++                    channel.team_id &&
++                    Object.hasOwn(myMembers, channel.id) &&
++                    (channel.delete_at === 0 || channel.id === currentChannelId)
++                )),
++            );
++            const isDm = (channel: Channel) => channel.type === General.DM_CHANNEL || channel.type === General.GM_CHANNEL;
++            const isUnread = (id: string) => calculateUnreadCount(messageCounts[id], myMembers[id], crtEnabled).showUnread;
++            const lastActivity = (channel: Channel) => Math.max(
++                crtEnabled ? (channel.last_root_post_at || channel.last_post_at) : channel.last_post_at,
++                channel.create_at,
++            );
++
++            const claimed = new Set(layout.groups.flatMap((group) => group.channelIds));
++            const unclaimed = Object.values(allChannels).
++                filter((channel) => !isDm(channel) && isListed(channel) && !claimed.has(channel.id)).
++                map((channel) => channel.id);
++
++            const getGroupIds = (group: AllTeamsGroup) => {
++                // New channels land on top of their built-in group, like in a native category.
++                if (group.id === DEFAULT_GROUP_ID) {
++                    return [...unclaimed, ...group.channelIds];
++                }
++                if (group.id === DM_GROUP_ID) {
++                    const placed = new Set(group.channelIds);
++                    return [...dmGroupIds.filter((id) => !placed.has(id)), ...group.channelIds.filter((id) => dmGroupIds.includes(id))];
++                }
++                return group.channelIds;
++            };
++
++            return layout.groups.map((group) => {
++                const channels = getGroupIds(group).map((id) => channelsById[id]).filter(isListed);
++
++                if (group.sorting !== 'manual') {
++                    channels.sort((a, b) => {
++                        if (unreadsFirst && isUnread(a.id) !== isUnread(b.id)) {
++                            return isUnread(a.id) ? -1 : 1;
++                        }
++                        if (group.sorting === 'alpha') {
++                            return a.display_name.localeCompare(b.display_name, locale, {numeric: true});
++                        }
++                        return lastActivity(b) - lastActivity(a);
++                    });
++                }
++
++                const shown = group.collapsed ? channels.filter((channel) => channel.id === currentChannelId) : channels;
++                return {group, shownIds: shown.map((channel) => channel.id)};
++            });
++        },
++    );
++
++    return (state: GlobalState, layout: AllTeamsLayout) => {
++        const openDms = filterOpenDms(state, getMyDms(state), CUSTOM_CATEGORY);
++        const dmGroupDms = filterDmGroup(state, getUnclaimedDms(state, layout), DM_CATEGORY);
++        return getGroups(state, layout, openDms, dmGroupDms);
++    };
++}
+diff --git a/webapp/channels/src/utils/all_teams_mode.test.ts b/webapp/channels/src/utils/all_teams_mode.test.ts
+new file mode 100644
+index 00000000..1aeef5ae
+--- /dev/null
++++ b/webapp/channels/src/utils/all_teams_mode.test.ts
+@@ -0,0 +1,83 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++type Mode = typeof import('./all_teams_mode');
++
++const KEY = 'mm_all_teams_layout';
++
++const response = (status: number, body = '') => ({status, ok: status < 300, text: async () => body});
++const flush = () => new Promise((resolve) => setTimeout(resolve));
++
++function load(): Mode {
++    let mode: Mode;
++    jest.isolateModules(() => {
++        mode = require('./all_teams_mode');
++    });
++    return mode!;
++}
++
++const mine = (mode: Mode) => mode.addGroup(mode.makeDefaultLayout(), 'g', 'Mine');
++const names = (mode: Mode) => mode.getAllTeamsLayout().groups.map((group) => group.name);
++const puts = (fetchMock: jest.Mock) => fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT');
++
++describe('ALL layout persistence', () => {
++    let fetchMock: jest.Mock;
++
++    beforeEach(() => {
++        window.localStorage.clear();
++        fetchMock = jest.fn().mockResolvedValue(response(204));
++        global.fetch = fetchMock;
++    });
++
++    test('the file restores a wiped localStorage', async () => {
++        const mode = load();
++        fetchMock.mockResolvedValue(response(200, JSON.stringify(mine(mode))));
++
++        await mode.syncAllTeamsLayout();
++
++        expect(names(mode)).toEqual(['Mine', 'Channels', 'Direct messages']);
++        expect(JSON.parse(window.localStorage.getItem(KEY)!).groups).toHaveLength(3);
++        expect(puts(fetchMock)).toHaveLength(0);
++    });
++
++    test('with no file yet, an existing localStorage layout seeds it', async () => {
++        window.localStorage.setItem(KEY, JSON.stringify(mine(load())));
++        const mode = load();
++
++        await mode.syncAllTeamsLayout();
++        await flush();
++
++        expect(names(mode)).toEqual(['Mine', 'Channels', 'Direct messages']);
++        expect(JSON.parse(puts(fetchMock)[0][1].body).groups).toHaveLength(3);
++    });
++
++    test('changes reach the file in order', async () => {
++        const mode = load();
++        await mode.syncAllTeamsLayout();
++        await flush();
++        fetchMock.mockClear();
++
++        mode.setAllTeamsLayout(mine(mode));
++        mode.setAllTeamsLayout(mode.renameGroup(mine(mode), 'g', 'Renamed'));
++        await flush();
++
++        expect(puts(fetchMock).map(([, init]) => JSON.parse(init.body).groups[0].name)).toEqual(['Mine', 'Renamed']);
++    });
++
++    test.each([
++        ['corrupt file', () => Promise.resolve(response(200, '{oops'))],
++        ['server error', () => Promise.resolve(response(500))],
++        ['network failure', () => Promise.reject(new Error('down'))],
++    ])('%s: keeps localStorage and never overwrites the file', async (_, reply) => {
++        window.localStorage.setItem(KEY, JSON.stringify(mine(load())));
++        const mode = load();
++        fetchMock.mockImplementation(reply);
++
++        await mode.syncAllTeamsLayout();
++        mode.setAllTeamsLayout(mode.renameGroup(mode.getAllTeamsLayout(), 'g', 'Local'));
++        await flush();
++
++        expect(names(mode)).toEqual(['Local', 'Channels', 'Direct messages']);
++        expect(puts(fetchMock)).toHaveLength(0);
++    });
++});
+diff --git a/webapp/channels/src/utils/all_teams_mode.ts b/webapp/channels/src/utils/all_teams_mode.ts
+new file mode 100644
+index 00000000..618e0b15
+--- /dev/null
++++ b/webapp/channels/src/utils/all_teams_mode.ts
+@@ -0,0 +1,233 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): UI-only "ALL" pseudo-team. When on, the channel sidebar shows every channel from
++// every team instead of the current team's categories. Its categories and channel order never reach
++// the Mattermost server: the local dev server keeps them in a file, and localStorage is a cache of it.
++
++import {useSyncExternalStore} from 'react';
++
++export type AllTeamsSorting = 'manual' | 'recency' | 'alpha';
++
++export type AllTeamsGroup = {
++    id: string;
++    name: string;
++    collapsed: boolean;
++    sorting: AllTeamsSorting;
++    channelIds: string[];
++};
++
++export type AllTeamsLayout = {
++    groups: AllTeamsGroup[];
++};
++
++// Holds every channel that no other group claims, so it always exists and can't be deleted.
++export const DEFAULT_GROUP_ID = 'default';
++
++// Same idea for DMs and GMs: those that no custom group claims live here.
++export const DM_GROUP_ID = 'dms';
++
++const MODE_KEY = 'mm_all_teams_mode';
++const LAYOUT_KEY = 'mm_all_teams_layout';
++const LAYOUT_URL = '/__all_teams_layout';
++
++export function makeDefaultLayout(): AllTeamsLayout {
++    return {groups: [makeBuiltInGroup(DEFAULT_GROUP_ID, 'Channels'), makeDmGroup()]};
++}
++
++function makeBuiltInGroup(id: string, name: string): AllTeamsGroup {
++    return {id, name, collapsed: false, sorting: 'recency', channelIds: []};
++}
++
++function makeDmGroup() {
++    return makeBuiltInGroup(DM_GROUP_ID, 'Direct messages');
++}
++
++export function isBuiltInGroup(groupId: string) {
++    return groupId === DEFAULT_GROUP_ID || groupId === DM_GROUP_ID;
++}
++
++function readLayout(raw: string | null): AllTeamsLayout | null {
++    try {
++        const layout = JSON.parse(raw ?? '');
++        if (layout.groups.some((group: AllTeamsGroup) => group.id === DEFAULT_GROUP_ID)) {
++            // Layouts saved before DMs were listed don't have this group yet.
++            const hasDms = layout.groups.some((group: AllTeamsGroup) => group.id === DM_GROUP_ID);
++            return hasDms ? layout : {groups: [...layout.groups, makeDmGroup()]};
++        }
++    } catch {
++        // Missing or corrupt.
++    }
++    return null;
++}
++
++export function parseLayout(raw: string | null): AllTeamsLayout {
++    return readLayout(raw) ?? makeDefaultLayout();
++}
++
++function updateGroup(layout: AllTeamsLayout, groupId: string, change: Partial<AllTeamsGroup>): AllTeamsLayout {
++    return {groups: layout.groups.map((group) => (group.id === groupId ? {...group, ...change} : group))};
++}
++
++export function addGroup(layout: AllTeamsLayout, id: string, name: string): AllTeamsLayout {
++    const group: AllTeamsGroup = {id, name, collapsed: false, sorting: 'manual', channelIds: []};
++    return {groups: [group, ...layout.groups]};
++}
++
++export function renameGroup(layout: AllTeamsLayout, groupId: string, name: string): AllTeamsLayout {
++    return updateGroup(layout, groupId, {name});
++}
++
++export function setGroupCollapsed(layout: AllTeamsLayout, groupId: string, collapsed: boolean): AllTeamsLayout {
++    return updateGroup(layout, groupId, {collapsed});
++}
++
++export function setGroupSorting(layout: AllTeamsLayout, groupId: string, sorting: AllTeamsSorting): AllTeamsLayout {
++    return updateGroup(layout, groupId, {sorting});
++}
++
++// Its channels fall back to the built-in groups, because nothing else claims them any more.
++export function deleteGroup(layout: AllTeamsLayout, groupId: string): AllTeamsLayout {
++    if (isBuiltInGroup(groupId)) {
++        return layout;
++    }
++    return {groups: layout.groups.filter((group) => group.id !== groupId)};
++}
++
++export function moveGroup(layout: AllTeamsLayout, groupId: string, index: number): AllTeamsLayout {
++    const moved = layout.groups.find((group) => group.id === groupId);
++    if (!moved) {
++        return layout;
++    }
++    const groups = layout.groups.filter((group) => group !== moved);
++    groups.splice(index, 0, moved);
++    return {groups};
++}
++
++// Drops a channel at `index` of what the destination group currently shows, then pins that order by
++// making the group manual. Channels the group holds but doesn't show (collapsed, archived, not loaded
++// yet) keep their membership at the end of the list.
++export function moveChannel(layout: AllTeamsLayout, channelId: string, destinationId: string, index: number, shownIds: string[]): AllTeamsLayout {
++    return {
++        groups: layout.groups.map((group) => {
++            const others = group.channelIds.filter((id) => id !== channelId);
++            if (group.id !== destinationId) {
++                return others.length === group.channelIds.length ? group : {...group, channelIds: others};
++            }
++
++            const shown = shownIds.filter((id) => id !== channelId);
++            shown.splice(index, 0, channelId);
++            const hidden = others.filter((id) => !shown.includes(id));
++            return {...group, sorting: 'manual' as const, channelIds: [...shown, ...hidden]};
++        }),
++    };
++}
++
++function readStorage(key: string): string | null {
++    try {
++        return window.localStorage.getItem(key);
++    } catch {
++        return null;
++    }
++}
++
++function writeStorage(key: string, value: string) {
++    try {
++        window.localStorage.setItem(key, value);
++    } catch {
++        // Storage can be blocked; the in-memory value still works for this session.
++    }
++}
++
++const listeners = new Set<() => void>();
++let mode = readStorage(MODE_KEY) === '1';
++let layoutState = parseLayout(readStorage(LAYOUT_KEY));
++let syncStarted = false;
++let canPush = false;
++let pushQueue: Promise<unknown> = Promise.resolve();
++
++function emit() {
++    listeners.forEach((listener) => listener());
++}
++
++export function subscribeAllTeams(listener: () => void) {
++    listeners.add(listener);
++    return () => {
++        listeners.delete(listener);
++    };
++}
++
++export function isAllTeamsMode() {
++    return mode;
++}
++
++export function setAllTeamsMode(on: boolean) {
++    if (mode === on) {
++        return;
++    }
++    mode = on;
++    writeStorage(MODE_KEY, on ? '1' : '0');
++    emit();
++}
++
++export function getAllTeamsLayout() {
++    return layoutState;
++}
++
++// Queued so that quick successive changes can't reach the file out of order.
++function pushLayout() {
++    if (!canPush) {
++        return;
++    }
++    const body = JSON.stringify(layoutState);
++    pushQueue = pushQueue.
++        then(() => fetch(LAYOUT_URL, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body})).
++        then((response) => {
++            if (!response.ok) {
++                throw new Error(`HTTP ${response.status}`);
++            }
++        }).
++        catch((error) => {
++            // eslint-disable-next-line no-console
++            console.error('[all-teams] failed to save the layout', error);
++        });
++}
++
++export function setAllTeamsLayout(next: AllTeamsLayout) {
++    layoutState = next;
++    writeStorage(LAYOUT_KEY, JSON.stringify(next));
++    pushLayout();
++    emit();
++}
++
++// The file wins over localStorage, which is what restores a wiped browser profile. With no file yet,
++// localStorage seeds it. If the file can't be read or is corrupt, nothing is pushed, so a bad read
++// can never overwrite a good file.
++export async function syncAllTeamsLayout() {
++    if (syncStarted) {
++        return;
++    }
++    syncStarted = true;
++
++    try {
++        const response = await fetch(LAYOUT_URL, {headers: {Accept: 'application/json'}});
++        if (response.status === 204) {
++            canPush = true;
++            pushLayout();
++        } else if (response.ok) {
++            const layout = readLayout(await response.text());
++            if (layout) {
++                canPush = true;
++                layoutState = layout;
++                writeStorage(LAYOUT_KEY, JSON.stringify(layout));
++                emit();
++            }
++        }
++    } catch {
++        // No dev server to talk to: stay on localStorage.
++    }
++}
++
++export function useAllTeamsLayout() {
++    return useSyncExternalStore(subscribeAllTeams, getAllTeamsLayout);
++}

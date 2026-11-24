@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 24 Nov 2026 16:41:19 +0300
+Subject: [PATCH 06/11] Never hide failed sends and show sending/failed marks
+
+Keep failed posts visible on errors where upstream silently removed them,
+report send failures to /__client_log, and show a pending or failed status
+icon on the post.
+---
+ .../src/components/post/post_component.tsx    |  2 +
+ .../post_send_status/index.test.tsx           | 36 ++++++++++
+ .../src/components/post_send_status/index.tsx | 65 +++++++++++++++++++
+ .../post_send_status/post_send_status.scss    | 37 +++++++++++
+ webapp/channels/src/i18n/ru.json              |  1 +
+ .../mattermost-redux/src/actions/posts.ts     | 35 ++++++----
+ 6 files changed, 165 insertions(+), 11 deletions(-)
+ create mode 100644 webapp/channels/src/components/post_send_status/index.test.tsx
+ create mode 100644 webapp/channels/src/components/post_send_status/index.tsx
+ create mode 100644 webapp/channels/src/components/post_send_status/post_send_status.scss
+
+diff --git a/webapp/channels/src/components/post/post_component.tsx b/webapp/channels/src/components/post/post_component.tsx
+index 0d23fb63..042fae3a 100644
+--- a/webapp/channels/src/components/post/post_component.tsx
++++ b/webapp/channels/src/components/post/post_component.tsx
+@@ -34,6 +34,7 @@ import PostMessageContainer from 'components/post_view/post_message_view';
+ import PostPreHeader from 'components/post_view/post_pre_header';
+ import PostTime from 'components/post_view/post_time';
+ import ReactionList from 'components/post_view/reaction_list';
++import {PostSendStatus} from 'components/post_send_status';
+ import ThreadFooter from 'components/threading/channel_threads/thread_footer';
+ import type {Props as TimestampProps} from 'components/timestamp/timestamp';
+ import ArchiveIcon from 'components/widgets/icons/archive_icon';
+@@ -666,6 +667,7 @@ function PostComponent(props: Props) {
+                             {threadFooter}
+                         </div>
+                     </div>
++                    <PostSendStatus post={post}/>
+                 </div>
+             </PostAriaLabelDiv>
+         </>
+diff --git a/webapp/channels/src/components/post_send_status/index.test.tsx b/webapp/channels/src/components/post_send_status/index.test.tsx
+new file mode 100644
+index 00000000..9cc23e92
+--- /dev/null
++++ b/webapp/channels/src/components/post_send_status/index.test.tsx
+@@ -0,0 +1,36 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import React from 'react';
++
++import {renderWithContext, screen} from 'tests/react_testing_utils';
++import {TestHelper} from 'utils/test_helper';
++
++import {PostSendStatus} from './index';
++
++const post = TestHelper.getPostMock({id: 'p1', channel_id: 'c1', user_id: 'me', type: '', pending_post_id: ''});
++const pending = {...post, id: 'me:1', pending_post_id: 'me:1'};
++
++describe('PostSendStatus', () => {
++    test('shows a sending mark while a post is pending', () => {
++        renderWithContext(<PostSendStatus post={pending}/>);
++        expect(screen.getByTestId('postSendPending')).toBeInTheDocument();
++        expect(screen.queryByTestId('postSendFailed')).not.toBeInTheDocument();
++    });
++
++    test('shows a failed mark when sending fails', () => {
++        renderWithContext(<PostSendStatus post={{...pending, failed: true}}/>);
++        expect(screen.getByTestId('postSendFailed')).toBeInTheDocument();
++        expect(screen.queryByTestId('postSendPending')).not.toBeInTheDocument();
++    });
++
++    test('renders nothing once delivered', () => {
++        const {container} = renderWithContext(<PostSendStatus post={post}/>);
++        expect(container.firstChild).toBeNull();
++    });
++
++    test('renders nothing for system posts', () => {
++        const {container} = renderWithContext(<PostSendStatus post={{...pending, type: 'system_join_channel'}}/>);
++        expect(container.firstChild).toBeNull();
++    });
++});
+diff --git a/webapp/channels/src/components/post_send_status/index.tsx b/webapp/channels/src/components/post_send_status/index.tsx
+new file mode 100644
+index 00000000..db00e080
+--- /dev/null
++++ b/webapp/channels/src/components/post_send_status/index.tsx
+@@ -0,0 +1,65 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): show a muted check while a post is sending and an explicit error icon if
++// sending failed, so a dropped message cannot go unnoticed.
++
++import React from 'react';
++import {useIntl} from 'react-intl';
++
++import {AlertCircleOutlineIcon, CheckIcon} from '@mattermost/compass-icons/components';
++import type {Post} from '@mattermost/types/posts';
++
++import {isPostEphemeral, isSystemMessage} from 'mattermost-redux/utils/post_utils';
++
++import './post_send_status.scss';
++
++export function isPostPending(post: Post) {
++    return Boolean(post.pending_post_id) && post.id === post.pending_post_id;
++}
++
++export function PostSendStatus({post}: {post: Post}) {
++    const {formatMessage} = useIntl();
++
++    if (isSystemMessage(post) || isPostEphemeral(post)) {
++        return null;
++    }
++
++    if (post.failed) {
++        const label = formatMessage({id: 'post_send.failed', defaultMessage: 'Not sent'});
++        return (
++            <div className='post-send-extra'>
++                <div className='post-send-extra__item'>
++                    <span
++                        aria-label={label}
++                        className='post-send-status post-send-status_failed'
++                        data-testid='postSendFailed'
++                        role='img'
++                        title={label}
++                    >
++                        <AlertCircleOutlineIcon size={16}/>
++                    </span>
++                </div>
++            </div>
++        );
++    }
++
++    if (isPostPending(post)) {
++        return (
++            <div className='post-send-extra'>
++                <div className='post-send-extra__item'>
++                    <span
++                        className='post-send-status'
++                        data-testid='postSendPending'
++                    >
++                        <span className='post-send-status__icon'>
++                            <CheckIcon/>
++                        </span>
++                    </span>
++                </div>
++            </div>
++        );
++    }
++
++    return null;
++}
+diff --git a/webapp/channels/src/components/post_send_status/post_send_status.scss b/webapp/channels/src/components/post_send_status/post_send_status.scss
+new file mode 100644
+index 00000000..14fc9159
+--- /dev/null
++++ b/webapp/channels/src/components/post_send_status/post_send_status.scss
+@@ -0,0 +1,37 @@
++// PATCH(all-teams): styles for pending and failed post send status icons.
++.post .post-send-extra {
++    position: relative;
++    display: flex;
++    width: 30px;
++    flex-direction: column;
++    align-items: center;
++    justify-content: flex-end;
++    padding-bottom: 8px;
++}
++
++.post .post-send-extra__item {
++    display: flex;
++    min-width: 18px;
++    min-height: 16px;
++    align-items: center;
++    justify-content: center;
++}
++
++.post-send-status {
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    gap: 2px;
++    pointer-events: auto;
++}
++
++.post-send-status_failed {
++    color: var(--error-text, #d24b4e);
++}
++
++.post-send-status__icon {
++    display: inline-flex;
++    color: rgba(var(--center-channel-color-rgb), 0.45);
++    font-size: 16px;
++    line-height: 1;
++}
+diff --git a/webapp/channels/src/i18n/ru.json b/webapp/channels/src/i18n/ru.json
+index 78468d45..60ac5f22 100644
+--- a/webapp/channels/src/i18n/ru.json
++++ b/webapp/channels/src/i18n/ru.json
+@@ -4526,6 +4526,7 @@
+   "post_info.post_reminder.sub_menu.tomorrow": "Завтра",
+   "post_info.post_reminder.sub_menu.two_hours": "2 часа",
+   "post_info.reply": "Ответить",
++  "post_send.failed": "Не отправлено",
+   "post_info.submenu.icon": "значок подменю",
+   "post_info.submenu.mobile": "мобильное подменю",
+   "post_info.system": "Система",
+diff --git a/webapp/channels/src/packages/mattermost-redux/src/actions/posts.ts b/webapp/channels/src/packages/mattermost-redux/src/actions/posts.ts
+index c5df41d7..359eda31 100644
+--- a/webapp/channels/src/packages/mattermost-redux/src/actions/posts.ts
++++ b/webapp/channels/src/packages/mattermost-redux/src/actions/posts.ts
+@@ -176,6 +176,26 @@ export type CreatePostReturnType = {
+     error?: string;
+ }
+ 
++// PATCH(all-teams): the proxy can't know about a send that never reached it. Ids and statuses only.
++function reportFailedPost(post: Post, error: any, isWebsocketConnected: boolean) {
++    fetch('/__client_log', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        body: JSON.stringify({
++            event: 'post_failed',
++            pending_post_id: post.pending_post_id,
++            channel_id: post.channel_id,
++            root_id: post.root_id,
++            status_code: error.status_code,
++            server_error_id: error.server_error_id,
++            online: navigator.onLine,
++            ws: isWebsocketConnected,
++        }),
++    }).catch(() => {
++        // Logging must never get in the way of the send's own failure handling.
++    });
++}
++
+ export function createPost(
+     post: Post,
+     files: any[] = [],
+@@ -288,18 +308,11 @@ export function createPost(
+                     update_at: Date.now(),
+                 };
+                 actions = [{type: PostTypes.CREATE_POST_FAILURE, error}];
++                reportFailedPost(data, error, getState().websocket.connected);
+ 
+-                // If the failure was because: the root post was deleted or
+-                // TownSquareIsReadOnly=true then remove the post
+-                if (error.server_error_id === 'api.post.create_post.root_id.app_error' ||
+-                    error.server_error_id === 'api.post.create_post.town_square_read_only' ||
+-                    error.server_error_id === 'plugin.message_will_be_posted.dismiss_post'
+-                ) {
+-                    // RemovePost is a Thunk, and not handled by batchActions
+-                    dispatch(removePost(data));
+-                } else {
+-                    actions.push(receivedPost(data, crtEnabled));
+-                }
++                // PATCH(all-teams): upstream silently removes the post on some errors, which looks like
++                // a message that was sent. It stays as failed instead: Cancel removes it.
++                actions.push(receivedPost(data, crtEnabled));
+ 
+                 dispatch(batchActions(actions, 'BATCH_CREATE_POST_FAILED'));
+                 return {error};

@@ -1,0 +1,961 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 24 Nov 2026 15:11:15 +0300
+Subject: [PATCH 11/11] Recover from render/chunk crashes and retry transient
+ permalink loads
+
+---
+ webapp/channels/src/components/app.tsx        |   8 +-
+ .../components/app_error_boundary.test.tsx    |  89 ++++++++
+ .../src/components/app_error_boundary.tsx     | 205 ++++++++++++++++++
+ webapp/channels/src/components/async_load.tsx |  18 +-
+ .../channel_layout/center_channel/index.ts    |   4 +-
+ .../src/components/permalink_view/actions.ts  |  67 ++++--
+ .../permalink_view/permalink_view.test.tsx    |  25 +++
+ .../permalink_view/permalink_view.tsx         |  49 ++++-
+ webapp/channels/src/components/post/index.tsx |  12 +-
+ .../components/post_view/post_list/index.tsx  |   4 +-
+ webapp/channels/src/entry.tsx                 |  11 +
+ .../channels/src/utils/crash_recovery.test.ts |  65 ++++++
+ webapp/channels/src/utils/crash_recovery.ts   | 105 +++++++++
+ webapp/channels/src/utils/post_utils.ts       |   3 +
+ 14 files changed, 634 insertions(+), 31 deletions(-)
+ create mode 100644 webapp/channels/src/components/app_error_boundary.test.tsx
+ create mode 100644 webapp/channels/src/components/app_error_boundary.tsx
+ create mode 100644 webapp/channels/src/utils/crash_recovery.test.ts
+ create mode 100644 webapp/channels/src/utils/crash_recovery.ts
+
+diff --git a/webapp/channels/src/components/app.tsx b/webapp/channels/src/components/app.tsx
+index ca1f583f..7e8db2fe 100644
+--- a/webapp/channels/src/components/app.tsx
++++ b/webapp/channels/src/components/app.tsx
+@@ -7,6 +7,7 @@ import {Router} from 'react-router-dom';
+ 
+ import store from 'stores/redux_store';
+ 
++import AppErrorBoundary from 'components/app_error_boundary';
+ import {makeAsyncComponent} from 'components/async_load';
+ 
+ import {getHistory} from 'utils/browser_history';
+@@ -18,7 +19,12 @@ const App = () => {
+     return (
+         <Provider store={store}>
+             <Router history={getHistory()}>
+-                <Root/>
++                <AppErrorBoundary
++                    componentName='App'
++                    fullPage={true}
++                >
++                    <Root/>
++                </AppErrorBoundary>
+             </Router>
+         </Provider>
+     );
+diff --git a/webapp/channels/src/components/app_error_boundary.test.tsx b/webapp/channels/src/components/app_error_boundary.test.tsx
+new file mode 100644
+index 00000000..25de039d
+--- /dev/null
++++ b/webapp/channels/src/components/app_error_boundary.test.tsx
+@@ -0,0 +1,89 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import React from 'react';
++
++import {fireEvent, render, screen} from 'tests/react_testing_utils';
++import * as CrashRecovery from 'utils/crash_recovery';
++
++import AppErrorBoundary from './app_error_boundary';
++
++function Thrower({error}: {error: Error | null}) {
++    if (error) {
++        throw error;
++    }
++    return <div>{'ok'}</div>;
++}
++
++describe('components/AppErrorBoundary', () => {
++    let consoleErrorSpy: jest.SpyInstance;
++
++    beforeEach(() => {
++        CrashRecovery.resetCrashRecoveryForTests();
++        consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++    });
++
++    afterEach(() => {
++        consoleErrorSpy.mockRestore();
++        jest.restoreAllMocks();
++    });
++
++    test('catches render errors, reports them, and recovers on Retry', () => {
++        const reportSpy = jest.spyOn(CrashRecovery, 'reportClientError').mockImplementation(() => {});
++        let shouldThrow = true;
++
++        function Flaky() {
++            if (shouldThrow) {
++                throw new Error('render exploded');
++            }
++            return <div>{'recovered'}</div>;
++        }
++
++        render(
++            <AppErrorBoundary componentName='PermalinkView'>
++                <Flaky/>
++            </AppErrorBoundary>,
++        );
++
++        expect(screen.getByTestId('app-error-boundary')).toBeInTheDocument();
++        expect(reportSpy).toHaveBeenCalledWith('react_crash', expect.any(Error), {component: 'PermalinkView'});
++
++        shouldThrow = false;
++        fireEvent.click(screen.getByRole('button', {name: 'Повторить'}));
++        expect(screen.getByText('recovered')).toBeInTheDocument();
++    });
++
++    test('triggers a guarded reload on ChunkLoadError', () => {
++        const reportSpy = jest.spyOn(CrashRecovery, 'reportClientError').mockImplementation(() => {});
++        const reloadSpy = jest.spyOn(CrashRecovery, 'tryReloadOnceForChunkError').mockReturnValue(true);
++
++        const chunkErr = new Error('Loading chunk 1300 failed.');
++        chunkErr.name = 'ChunkLoadError';
++
++        render(
++            <AppErrorBoundary componentName='PermalinkView'>
++                <Thrower error={chunkErr}/>
++            </AppErrorBoundary>,
++        );
++
++        expect(reportSpy).toHaveBeenCalledWith('chunk_load_error', chunkErr, {component: 'PermalinkView'});
++        expect(reloadSpy).toHaveBeenCalledTimes(1);
++        expect(screen.getByText('Обновление приложения…')).toBeInTheDocument();
++    });
++
++    test('shows a manual Reload button when auto-reload was already attempted', () => {
++        jest.spyOn(CrashRecovery, 'reportClientError').mockImplementation(() => {});
++        jest.spyOn(CrashRecovery, 'tryReloadOnceForChunkError').mockReturnValue(false);
++
++        const chunkErr = new Error('Loading chunk 1300 failed.');
++        chunkErr.name = 'ChunkLoadError';
++
++        render(
++            <AppErrorBoundary componentName='PermalinkView'>
++                <Thrower error={chunkErr}/>
++            </AppErrorBoundary>,
++        );
++
++        expect(screen.getByRole('button', {name: 'Перезагрузить'})).toBeInTheDocument();
++    });
++});
+diff --git a/webapp/channels/src/components/app_error_boundary.tsx b/webapp/channels/src/components/app_error_boundary.tsx
+new file mode 100644
+index 00000000..9eee6cb5
+--- /dev/null
++++ b/webapp/channels/src/components/app_error_boundary.tsx
+@@ -0,0 +1,205 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): catches render and lazy-chunk failures so the app never freezes on a white screen.
++
++import React from 'react';
++
++import {getHistory} from 'utils/browser_history';
++import {isChunkLoadError, reportClientError, tryReloadOnceForChunkError} from 'utils/crash_recovery';
++
++type Props = {
++    children: React.ReactNode;
++    componentName?: string;
++    fullPage?: boolean;
++};
++
++type State = {
++    error: Error | null;
++    reloading: boolean;
++};
++
++const containerStyle: React.CSSProperties = {
++    display: 'flex',
++    alignItems: 'center',
++    justifyContent: 'center',
++    padding: '32px 16px',
++    width: '100%',
++    height: '100%',
++    minHeight: '200px',
++    boxSizing: 'border-box',
++    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
++    color: '#222',
++    backgroundColor: '#fff',
++};
++
++const cardStyle: React.CSSProperties = {
++    maxWidth: '420px',
++    width: '100%',
++    padding: '20px 24px',
++    border: '1px solid #d9dce1',
++    borderRadius: '8px',
++    backgroundColor: '#fff',
++    boxShadow: '0 2px 10px rgba(0, 0, 0, 0.06)',
++};
++
++const titleStyle: React.CSSProperties = {
++    margin: '0 0 8px',
++    fontSize: '16px',
++    fontWeight: 600,
++};
++
++const textStyle: React.CSSProperties = {
++    margin: '0 0 16px',
++    fontSize: '13px',
++    lineHeight: 1.5,
++    color: '#555',
++};
++
++const actionsStyle: React.CSSProperties = {
++    display: 'flex',
++    gap: '8px',
++    flexWrap: 'wrap',
++};
++
++const primaryButtonStyle: React.CSSProperties = {
++    padding: '7px 14px',
++    fontSize: '13px',
++    fontWeight: 600,
++    color: '#fff',
++    backgroundColor: '#1c58d9',
++    border: 'none',
++    borderRadius: '4px',
++    cursor: 'pointer',
++};
++
++const secondaryButtonStyle: React.CSSProperties = {
++    padding: '7px 14px',
++    fontSize: '13px',
++    fontWeight: 600,
++    color: '#1c58d9',
++    backgroundColor: 'transparent',
++    border: '1px solid #1c58d9',
++    borderRadius: '4px',
++    cursor: 'pointer',
++};
++
++export default class AppErrorBoundary extends React.PureComponent<Props, State> {
++    private unlistenHistory?: () => void;
++
++    state: State = {
++        error: null,
++        reloading: false,
++    };
++
++    static getDerivedStateFromError(error: Error): Partial<State> {
++        return {error};
++    }
++
++    componentDidMount() {
++        try {
++            const history = getHistory();
++            if (history && typeof history.listen === 'function') {
++                this.unlistenHistory = history.listen(() => {
++                    if (this.state.error && !this.state.reloading) {
++                        this.setState({error: null});
++                    }
++                });
++            }
++        } catch {
++            // History may not be initialized in isolated unit tests.
++        }
++    }
++
++    componentWillUnmount() {
++        this.unlistenHistory?.();
++    }
++
++    componentDidCatch(error: Error) {
++        const chunkError = isChunkLoadError(error);
++        reportClientError(chunkError ? 'chunk_load_error' : 'react_crash', error, {
++            component: this.props.componentName || 'App',
++        });
++
++        if (chunkError && tryReloadOnceForChunkError()) {
++            this.setState({reloading: true});
++        }
++    }
++
++    handleRetry = () => {
++        this.setState({error: null, reloading: false});
++    };
++
++    handleReload = () => {
++        window.location.reload();
++    };
++
++    handleGoHome = () => {
++        try {
++            getHistory().push('/');
++        } catch {
++            window.location.assign('/');
++            return;
++        }
++        this.setState({error: null, reloading: false});
++    };
++
++    render() {
++        if (!this.state.error) {
++            return this.props.children;
++        }
++
++        const isChunk = isChunkLoadError(this.state.error);
++        const wrapperStyle: React.CSSProperties = this.props.fullPage ? {...containerStyle, minHeight: '100vh'} : containerStyle;
++
++        return (
++            <div
++                style={wrapperStyle}
++                role='alert'
++                data-testid='app-error-boundary'
++            >
++                <div style={cardStyle}>
++                    <h3 style={titleStyle}>
++                        {this.state.reloading ? 'Обновление приложения…' : 'Не удалось отобразить экран'}
++                    </h3>
++                    <p style={textStyle}>
++                        {this.state.reloading ?
++                            'Загружаем актуальную версию интерфейса…' :
++                            (isChunk ?
++                                'Часть интерфейса не загрузилась (возможно, обновилась сборка или пропала связь).' :
++                                'Произошла ошибка интерфейса. Можно попробовать снова или перезагрузить страницу.')}
++                    </p>
++                    {!this.state.reloading && (
++                        <div style={actionsStyle}>
++                            {!isChunk && (
++                                <button
++                                    type='button'
++                                    style={primaryButtonStyle}
++                                    onClick={this.handleRetry}
++                                >
++                                    {'Повторить'}
++                                </button>
++                            )}
++                            <button
++                                type='button'
++                                style={isChunk ? primaryButtonStyle : secondaryButtonStyle}
++                                onClick={this.handleReload}
++                            >
++                                {'Перезагрузить'}
++                            </button>
++                            {this.props.fullPage && (
++                                <button
++                                    type='button'
++                                    style={secondaryButtonStyle}
++                                    onClick={this.handleGoHome}
++                                >
++                                    {'На главную'}
++                                </button>
++                            )}
++                        </div>
++                    )}
++                </div>
++            </div>
++        );
++    }
++}
+diff --git a/webapp/channels/src/components/async_load.tsx b/webapp/channels/src/components/async_load.tsx
+index da72a5c0..f831012f 100644
+--- a/webapp/channels/src/components/async_load.tsx
++++ b/webapp/channels/src/components/async_load.tsx
+@@ -3,15 +3,19 @@
+ 
+ import React, {lazy, type ComponentType} from 'react';
+ 
++import AppErrorBoundary from 'components/app_error_boundary';
++
+ import type {PluggableComponentType, PluggableProps} from 'plugins/pluggable/pluggable';
+ 
+ import type {PluginsState, ProductSubComponentNames} from 'types/store/plugins';
+ 
+ export function makeAsyncComponent<ComponentProps>(displayName: string, LazyComponent: React.ComponentType<ComponentProps>, fallback: React.ReactNode = null) {
+     const Component: ComponentType<ComponentProps> = (props) => (
+-        <React.Suspense fallback={fallback}>
+-            <LazyComponent {...props}/>
+-        </React.Suspense>
++        <AppErrorBoundary componentName={displayName}>
++            <React.Suspense fallback={fallback}>
++                <LazyComponent {...props}/>
++            </React.Suspense>
++        </AppErrorBoundary>
+     );
+     Component.displayName = displayName;
+     return Component;
+@@ -21,9 +25,11 @@ export function makeAsyncPluggableComponent() {
+     const LazyComponent = lazy(() => import('plugins/pluggable')) as PluggableComponentType;
+ 
+     const Component = <T extends keyof PluginsState['components'], U extends ProductSubComponentNames>(props: PluggableProps<T, U>) => (
+-        <React.Suspense fallback={null}>
+-            <LazyComponent<T, U> {...props}/>
+-        </React.Suspense>
++        <AppErrorBoundary componentName='Pluggable'>
++            <React.Suspense fallback={null}>
++                <LazyComponent<T, U> {...props}/>
++            </React.Suspense>
++        </AppErrorBoundary>
+     );
+ 
+     Component.displayName = 'Pluggable';
+diff --git a/webapp/channels/src/components/channel_layout/center_channel/index.ts b/webapp/channels/src/components/channel_layout/center_channel/index.ts
+index 59bf14ec..98dafbf5 100644
+--- a/webapp/channels/src/components/channel_layout/center_channel/index.ts
++++ b/webapp/channels/src/components/channel_layout/center_channel/index.ts
+@@ -44,8 +44,8 @@ const mapStateToProps = (state: GlobalState, ownProps: OwnProps) => {
+         previousTeamLastViewedType = getPreviousTeamLastViewedType(state);
+     }
+ 
+-    if (!channelName) {
+-        channelName = getRedirectChannelNameForTeam(state, team!.id);
++    if (!channelName && team) {
++        channelName = getRedirectChannelNameForTeam(state, team.id);
+     }
+ 
+     let lastChannelPath;
+diff --git a/webapp/channels/src/components/permalink_view/actions.ts b/webapp/channels/src/components/permalink_view/actions.ts
+index 39dab7dc..19bb8075 100644
+--- a/webapp/channels/src/components/permalink_view/actions.ts
++++ b/webapp/channels/src/components/permalink_view/actions.ts
+@@ -28,11 +28,41 @@ import type {ActionFuncAsync, ThunkActionFunc} from 'types/store';
+ 
+ let privateChannelJoinPromptVisible = false;
+ 
++const PERMALINK_RETRY_DELAYS_MS = [300, 800];
++
++function isTransientPermalinkError(error: unknown): boolean {
++    if (!error || typeof error !== 'object') {
++        return true;
++    }
++    const status = (error as {status_code?: number}).status_code;
++    return status === undefined || status === 0 || status >= 500;
++}
++
++function sleep(ms: number): Promise<void> {
++    return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++async function fetchPostInfoWithRetry(postId: string) {
++    let lastError: unknown;
++    for (let attempt = 0; attempt <= PERMALINK_RETRY_DELAYS_MS.length; attempt++) {
++        try {
++            return await Client4.getPostInfo(postId);
++        } catch (error) {
++            lastError = error;
++            if (attempt >= PERMALINK_RETRY_DELAYS_MS.length || !isTransientPermalinkError(error)) {
++                throw error;
++            }
++            await sleep(PERMALINK_RETRY_DELAYS_MS[attempt]);
++        }
++    }
++    throw lastError;
++}
++
+ type Option = {
+     skipRedirectReplyPermalink: boolean;
+ }
+ 
+-function focusRootPost(post: Post, channel: Channel): ActionFuncAsync {
++function focusRootPost(post: Post, channel: Channel, returnTo = ''): ActionFuncAsync {
+     return async (dispatch, getState) => {
+         const postURL = getPostURL(getState(), post);
+ 
+@@ -43,7 +73,7 @@ function focusRootPost(post: Post, channel: Channel): ActionFuncAsync {
+             channelId: channel.id,
+         });
+ 
+-        getHistory().replace(postURL);
++        getHistory().replace(postURL || returnTo || '/');
+         return {data: true};
+     };
+ }
+@@ -79,7 +109,7 @@ function focusReplyPost(post: Post, channel: Channel, teamId: string, returnTo:
+             getHistory().replace(returnTo);
+         } else if (!sameTeam || !skipRedirectReplyPermalink) {
+             const postURL = getPostURL(state, post);
+-            getHistory().replace(postURL);
++            getHistory().replace(postURL || returnTo || '/');
+         }
+ 
+         dispatch(selectPostAndHighlight(post));
+@@ -96,7 +126,7 @@ export function focusPost(postId: string, returnTo = '', currentUserId: string,
+ 
+         let postInfo;
+         try {
+-            postInfo = await Client4.getPostInfo(postId);
++            postInfo = await fetchPostInfoWithRetry(postId);
+         } catch (e) {
+             getHistory().replace(`/error?type=${ErrorPageTypes.PERMALINK_NOT_FOUND}&returnTo=${returnTo}`);
+             return;
+@@ -131,9 +161,14 @@ export function focusPost(postId: string, returnTo = '', currentUserId: string,
+             await dispatch(joinChannel(currentUserId, '', postInfo.channel_id));
+         }
+ 
+-        const {data: threadData} = await dispatch(getPostThread(postId));
++        let threadResult = await dispatch(getPostThread(postId));
++        for (let attempt = 0; attempt < PERMALINK_RETRY_DELAYS_MS.length && !threadResult.data && 'error' in threadResult && isTransientPermalinkError(threadResult.error); attempt++) {
++            await sleep(PERMALINK_RETRY_DELAYS_MS[attempt]);
++            threadResult = await dispatch(getPostThread(postId));
++        }
++        const {data: threadData} = threadResult;
+ 
+-        if (!threadData) {
++        if (!threadData || !Array.isArray(threadData.order) || threadData.order.length === 0) {
+             getHistory().replace(`/error?type=${ErrorPageTypes.PERMALINK_NOT_FOUND}&returnTo=${returnTo}`);
+             return;
+         }
+@@ -143,10 +178,18 @@ export function focusPost(postId: string, returnTo = '', currentUserId: string,
+             return;
+         }
+ 
+-        const isCollapsed = isCollapsedThreadsEnabled(state);
++        const latestState = getState();
++        const isCollapsed = isCollapsedThreadsEnabled(latestState);
+ 
+-        const channelId = threadData.posts[threadData.order[0]].channel_id;
+-        let channel = getChannelFromRedux(state, channelId);
++        const firstPost = threadData.posts?.[threadData.order[0]];
++        const post = threadData.posts?.[postId];
++        if (!firstPost || !post) {
++            getHistory().replace(`/error?type=${ErrorPageTypes.PERMALINK_NOT_FOUND}&returnTo=${returnTo}`);
++            return;
++        }
++
++        const channelId = firstPost.channel_id;
++        let channel = getChannelFromRedux(latestState, channelId);
+ 
+         if (!channel) {
+             const {data: channelData} = await dispatch(getChannel(channelId));
+@@ -160,7 +203,7 @@ export function focusPost(postId: string, returnTo = '', currentUserId: string,
+         }
+ 
+         const teamId = channel.team_id || currentTeam.id;
+-        let myMember = state.entities.channels.myMembers[channelId];
++        let myMember = getState().entities.channels.myMembers[channelId];
+ 
+         if (!myMember) {
+             // If it's a DM or GM channel and we don't have a channel member for it already, user is not a member
+@@ -193,15 +236,13 @@ export function focusPost(postId: string, returnTo = '', currentUserId: string,
+             dispatch(loadNewGMIfNeeded(channel.id));
+         }
+ 
+-        const post = threadData.posts[postId];
+-
+         if (isCollapsed && isComment(post)) {
+             const {data} = await dispatch(focusReplyPost(post, channel, teamId, returnTo, option));
+             if (!data) {
+                 return;
+             }
+         } else {
+-            dispatch(focusRootPost(post, channel));
++            dispatch(focusRootPost(post, channel, returnTo));
+         }
+ 
+         dispatch(loadChannelsForCurrentUser());
+diff --git a/webapp/channels/src/components/permalink_view/permalink_view.test.tsx b/webapp/channels/src/components/permalink_view/permalink_view.test.tsx
+index 60532379..747a33af 100644
+--- a/webapp/channels/src/components/permalink_view/permalink_view.test.tsx
++++ b/webapp/channels/src/components/permalink_view/permalink_view.test.tsx
+@@ -340,6 +340,31 @@ describe('components/PermalinkView', () => {
+                 expect(getHistory().replace).toHaveBeenCalledWith('/currentteam/channels/channel1/postid1');
+             });
+ 
++            test('should retry getPostInfo on transient 502 error before redirecting', async () => {
++                const postId = 'postid1';
++                nock(Client4.getPostRoute(postId)).
++                    get('/info').
++                    reply(502, {message: 'bad gateway'});
++                nockInfoForPost(postId);
++
++                const testStore = await mockStore(initialState);
++                await testStore.dispatch(focusPost(postId, '/currentteam/channels/channel1', baseProps.currentUserId));
++
++                expect(getHistory().replace).toHaveBeenCalledWith('/currentteam/channels/channel1/postid1');
++            });
++
++            test('should not retry getPostInfo on 404 and should redirect to error page', async () => {
++                const postId = 'postid1';
++                nock(Client4.getPostRoute(postId)).
++                    get('/info').
++                    reply(404, {id: 'api.post.get.app_error', message: 'not found', status_code: 404});
++
++                const testStore = await mockStore(initialState);
++                await testStore.dispatch(focusPost(postId, '/currentteam/channels/channel1', baseProps.currentUserId));
++
++                expect(getHistory().replace).toHaveBeenCalledWith(`/error?type=${ErrorPageTypes.PERMALINK_NOT_FOUND}&returnTo=/currentteam/channels/channel1`);
++            });
++
+             test('should not redirect to channel link with postId for a reply permalink when collapsedThreads enabled and option is set true', async () => {
+                 const postId = 'replypostid1';
+                 nockInfoForPost(postId);
+diff --git a/webapp/channels/src/components/permalink_view/permalink_view.tsx b/webapp/channels/src/components/permalink_view/permalink_view.tsx
+index f4e2b8ef..26248f18 100644
+--- a/webapp/channels/src/components/permalink_view/permalink_view.tsx
++++ b/webapp/channels/src/components/permalink_view/permalink_view.tsx
+@@ -4,6 +4,9 @@
+ import React, {useState, useEffect, useCallback, memo, useRef} from 'react';
+ import type {match} from 'react-router-dom';
+ 
++import {getHistory} from 'utils/browser_history';
++import {reportClientError} from 'utils/crash_recovery';
++
+ type Props = {
+     channelId: string;
+ 
+@@ -22,6 +25,7 @@ type Props = {
+ const PermalinkView = (props: Props) => {
+     const mounted = useRef(false);
+     const [valid, setValid] = useState(false);
++    const [failed, setFailed] = useState(false);
+ 
+     useEffect(() => {
+         mounted.current = true;
+@@ -32,9 +36,19 @@ const PermalinkView = (props: Props) => {
+ 
+     const doPermalinkAction = useCallback(async () => {
+         const postId = props.match.params.postid;
+-        await props.actions.focusPost(postId, props.returnTo, props.currentUserId);
+         if (mounted.current) {
+-            setValid(true);
++            setFailed(false);
++        }
++        try {
++            await props.actions.focusPost(postId, props.returnTo, props.currentUserId);
++            if (mounted.current) {
++                setValid(true);
++            }
++        } catch (error) {
++            reportClientError('permalink_error', error, {component: 'PermalinkView'});
++            if (mounted.current) {
++                setFailed(true);
++            }
+         }
+     }, [props.match.params.postid, props.returnTo, props.currentUserId, props.actions]);
+ 
+@@ -43,6 +57,37 @@ const PermalinkView = (props: Props) => {
+         doPermalinkAction();
+     }, [doPermalinkAction]);
+ 
++    if (failed) {
++        return (
++            <div
++                id='app-content'
++                className='app__content'
++                style={{display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px'}}
++            >
++                <div style={{textAlign: 'center', maxWidth: '360px'}}>
++                    <p style={{marginBottom: '12px'}}>
++                        {'Не удалось открыть сообщение.'}
++                    </p>
++                    <button
++                        type='button'
++                        className='btn btn-primary'
++                        style={{marginRight: '8px'}}
++                        onClick={doPermalinkAction}
++                    >
++                        {'Повторить'}
++                    </button>
++                    <button
++                        type='button'
++                        className='btn btn-tertiary'
++                        onClick={() => getHistory().replace(props.returnTo || '/')}
++                    >
++                        {'Назад'}
++                    </button>
++                </div>
++            </div>
++        );
++    }
++
+     // it is returning null because main idea of this component is to fire focusPost redux action
+     if (valid && props.channelId && props.teamName) {
+         return null;
+diff --git a/webapp/channels/src/components/post/index.tsx b/webapp/channels/src/components/post/index.tsx
+index 10e040b8..ae52241d 100644
+--- a/webapp/channels/src/components/post/index.tsx
++++ b/webapp/channels/src/components/post/index.tsx
+@@ -131,12 +131,12 @@ function makeMapStateToProps() {
+         }
+ 
+         const currentTeam = getCurrentTeam(state);
+-        const team = getTeam(state, channel.team_id);
++        const team = channel ? getTeam(state, channel.team_id) : undefined;
+         let teamName = currentTeam?.name;
+         let teamDisplayName;
+ 
+         const memberships = getTeamMemberships(state);
+-        const isDMorGM = channel.type === General.DM_CHANNEL || channel.type === General.GM_CHANNEL;
++        const isDMorGM = channel?.type === General.DM_CHANNEL || channel?.type === General.GM_CHANNEL;
+         const rhsState = getRhsState(state);
+         if (
+             rhsState !== RHSStates.PIN && // Not show in pinned posts since they are all for the same channel
+@@ -148,8 +148,8 @@ function makeMapStateToProps() {
+             teamName = team?.name || currentTeam?.name;
+         }
+ 
+-        const canReply = isDMorGM || (channel.team_id === currentTeam?.id);
+-        const directTeammate = getDirectTeammate(state, channel.id);
++        const canReply = isDMorGM || (channel?.team_id === currentTeam?.id);
++        const directTeammate = channel ? getDirectTeammate(state, channel.id) : undefined;
+ 
+         const previewCollapsed = get(
+             state,
+@@ -200,8 +200,8 @@ function makeMapStateToProps() {
+             previewCollapsed,
+             previewEnabled,
+             post,
+-            channelName: channel.display_name,
+-            channelType: channel.type,
++            channelName: channel?.display_name,
++            channelType: channel?.type,
+             teamDisplayName,
+             displayName: getDisplayNameByUser(state, directTeammate),
+             teamName,
+diff --git a/webapp/channels/src/components/post_view/post_list/index.tsx b/webapp/channels/src/components/post_view/post_list/index.tsx
+index 617850c3..f9415a19 100644
+--- a/webapp/channels/src/components/post_view/post_list/index.tsx
++++ b/webapp/channels/src/components/post_view/post_list/index.tsx
+@@ -85,7 +85,9 @@ function makeMapStateToProps() {
+             if (postIds.length) {
+                 const latestPostId = memoizedGetLatestPostId(postIds);
+                 const latestPost = getPost(state, latestPostId);
+-                latestPostTimeStamp = latestPost.create_at;
++                if (latestPost) {
++                    latestPostTimeStamp = latestPost.create_at;
++                }
+             }
+         }
+ 
+diff --git a/webapp/channels/src/entry.tsx b/webapp/channels/src/entry.tsx
+index 8032020e..fea12404 100644
+--- a/webapp/channels/src/entry.tsx
++++ b/webapp/channels/src/entry.tsx
+@@ -11,6 +11,7 @@ import store from 'stores/redux_store';
+ import App from 'components/app';
+ 
+ import {AnnouncementBarTypes} from 'utils/constants';
++import {reportClientError} from 'utils/crash_recovery';
+ import {setCSRFFromCookie} from 'utils/utils';
+ 
+ // Import our styles
+@@ -34,6 +35,8 @@ function preRenderSetup(onPreRenderSetupReady: () => void) {
+             return;
+         }
+ 
++        reportClientError('window_error', error ?? msg);
++
+         store.dispatch(
+             logError(
+                 {
+@@ -47,6 +50,14 @@ function preRenderSetup(onPreRenderSetupReady: () => void) {
+         );
+     };
+ 
++    window.addEventListener('unhandledrejection', (event) => {
++        const reason = event.reason;
++        if (reason && typeof reason === 'object' && 'name' in reason && (reason as {name?: unknown}).name === 'AbortError') {
++            return;
++        }
++        reportClientError('unhandled_rejection', reason);
++    });
++
+     setCSRFFromCookie();
+ 
+     onPreRenderSetupReady();
+diff --git a/webapp/channels/src/utils/crash_recovery.test.ts b/webapp/channels/src/utils/crash_recovery.test.ts
+new file mode 100644
+index 00000000..699a2a89
+--- /dev/null
++++ b/webapp/channels/src/utils/crash_recovery.test.ts
+@@ -0,0 +1,65 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import {
++    formatErrorSummary,
++    isChunkLoadError,
++    reportClientError,
++    resetCrashRecoveryForTests,
++    tryReloadOnceForChunkError,
++} from './crash_recovery';
++
++describe('utils/crash_recovery', () => {
++    const originalFetch = global.fetch;
++
++    beforeEach(() => {
++        resetCrashRecoveryForTests();
++        global.fetch = jest.fn(() => Promise.resolve({ok: true} as Response));
++    });
++
++    afterAll(() => {
++        global.fetch = originalFetch;
++    });
++
++    test('identifies webpack and dynamic import chunk load errors', () => {
++        const chunkErr = new Error('Loading chunk 1300 failed.');
++        chunkErr.name = 'ChunkLoadError';
++        expect(isChunkLoadError(chunkErr)).toBe(true);
++        expect(isChunkLoadError(new Error('Loading CSS chunk 1660 failed.'))).toBe(true);
++        expect(isChunkLoadError(new Error('Failed to fetch dynamically imported module: /static/x.js'))).toBe(true);
++        expect(isChunkLoadError(new TypeError('Cannot read properties of undefined'))).toBe(false);
++    });
++
++    test('reports safe metadata to /__client_log and deduplicates bursts', () => {
++        const err = new TypeError('boom');
++        reportClientError('react_crash', err, {component: 'PermalinkView', route: '/team/pl/abc'});
++        reportClientError('react_crash', err, {component: 'PermalinkView', route: '/team/pl/abc'});
++
++        expect(global.fetch).toHaveBeenCalledTimes(1);
++        const [url, init] = (global.fetch as jest.Mock).mock.calls[0];
++        expect(url).toBe('/__client_log');
++        expect(JSON.parse(init.body)).toMatchObject({
++            event: 'react_crash',
++            component: 'PermalinkView',
++            error: 'TypeError:boom',
++            route: '/team/pl/abc',
++        });
++    });
++
++    test('formats non-Error objects without crashing', () => {
++        expect(formatErrorSummary({status_code: 502, server_error_id: 'bad_gateway'})).toBe('bad_gateway:502');
++        expect(formatErrorSummary(null)).toBe('unknown');
++    });
++
++    test('auto-reloads once on chunk errors and respects the cooldown window', () => {
++        const reload = jest.fn();
++        expect(tryReloadOnceForChunkError(100000, reload)).toBe(true);
++        expect(reload).toHaveBeenCalledTimes(1);
++
++        expect(tryReloadOnceForChunkError(105000, reload)).toBe(false);
++        expect(reload).toHaveBeenCalledTimes(1);
++
++        expect(tryReloadOnceForChunkError(135000, reload)).toBe(true);
++        expect(reload).toHaveBeenCalledTimes(2);
++    });
++});
+diff --git a/webapp/channels/src/utils/crash_recovery.ts b/webapp/channels/src/utils/crash_recovery.ts
+new file mode 100644
+index 00000000..8ab8cb4f
+--- /dev/null
++++ b/webapp/channels/src/utils/crash_recovery.ts
+@@ -0,0 +1,105 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): prevents uncaught React or chunk-load errors from leaving a silent white screen,
++// and reports safe diagnostic metadata to the local proxy log.
++
++const CHUNK_RELOAD_KEY = 'mm_chunk_reload_at';
++const CHUNK_RELOAD_COOLDOWN_MS = 30000;
++const ERROR_DEDUP_MS = 10000;
++
++const recentErrors = new Map<string, number>();
++
++export function isChunkLoadError(error: unknown): boolean {
++    if (!error) {
++        return false;
++    }
++    const name = typeof error === 'object' && 'name' in error ? String((error as {name?: unknown}).name ?? '') : '';
++    const message = typeof error === 'object' && 'message' in error ? String((error as {message?: unknown}).message ?? '') : String(error);
++    return (
++        name === 'ChunkLoadError' ||
++        (/Loading (?:CSS )?chunk [\w-]+ failed/i).test(message) ||
++        (/Failed to fetch dynamically imported module/i).test(message)
++    );
++}
++
++export function formatErrorSummary(error: unknown): string {
++    if (!error) {
++        return 'unknown';
++    }
++    if (error instanceof Error) {
++        const summary = error.message ? `${error.name}:${error.message}` : error.name;
++        return summary.slice(0, 140);
++    }
++    if (typeof error === 'object') {
++        const obj = error as {name?: unknown; message?: unknown; status_code?: unknown; server_error_id?: unknown};
++        const parts = [obj.name, obj.server_error_id, obj.status_code, obj.message].filter((v) => v !== undefined && v !== '');
++        if (parts.length > 0) {
++            return parts.map(String).join(':').slice(0, 140);
++        }
++    }
++    return String(error).slice(0, 140);
++}
++
++export function reportClientError(
++    event: string,
++    error: unknown,
++    details: {component?: string; route?: string} = {},
++): void {
++    const summary = formatErrorSummary(error);
++    const component = details.component ?? '';
++    const route = details.route ?? (typeof window !== 'undefined' ? window.location.pathname : '');
++    const key = `${event}|${component}|${summary}`;
++    const now = Date.now();
++    const last = recentErrors.get(key);
++    if (last !== undefined && now - last < ERROR_DEDUP_MS) {
++        return;
++    }
++    recentErrors.set(key, now);
++
++    if (typeof fetch !== 'function') {
++        return;
++    }
++    fetch('/__client_log', {
++        method: 'POST',
++        headers: {'Content-Type': 'application/json'},
++        keepalive: true,
++        body: JSON.stringify({
++            event,
++            component,
++            error: summary,
++            route,
++            online: typeof navigator !== 'undefined' ? navigator.onLine : true,
++        }),
++    }).catch(() => {
++        // Diagnostic logging must never break error recovery.
++    });
++}
++
++export function tryReloadOnceForChunkError(
++    now: number = Date.now(),
++    reload: () => void = () => window.location.reload(),
++): boolean {
++    try {
++        const lastRaw = window.sessionStorage.getItem(CHUNK_RELOAD_KEY);
++        const last = lastRaw ? Number(lastRaw) : 0;
++        if (last && now - last < CHUNK_RELOAD_COOLDOWN_MS) {
++            return false;
++        }
++        window.sessionStorage.setItem(CHUNK_RELOAD_KEY, String(now));
++    } catch {
++        // If sessionStorage is unavailable, avoid risking a reload loop.
++        return false;
++    }
++    reload();
++    return true;
++}
++
++export function resetCrashRecoveryForTests(): void {
++    recentErrors.clear();
++    try {
++        window.sessionStorage.removeItem(CHUNK_RELOAD_KEY);
++    } catch {
++        // Ignore.
++    }
++}
+diff --git a/webapp/channels/src/utils/post_utils.ts b/webapp/channels/src/utils/post_utils.ts
+index b6d399e7..3997dfc2 100644
+--- a/webapp/channels/src/utils/post_utils.ts
++++ b/webapp/channels/src/utils/post_utils.ts
+@@ -665,6 +665,9 @@ export function getPostURL(state: GlobalState, post: Post): string {
+     case Constants.DM_CHANNEL: {
+         const userId = getUserIdFromChannelName(currentUserId, channel.name);
+         const user = getUser(state, userId);
++        if (!user) {
++            return '';
++        }
+         return `/${team.name}/messages/@${user.username}${postURI}`;
+     }
+     case Constants.GM_CHANNEL:

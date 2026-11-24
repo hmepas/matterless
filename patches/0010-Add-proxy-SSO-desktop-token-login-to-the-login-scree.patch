@@ -1,0 +1,596 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 24 Nov 2026 11:33:30 +0300
+Subject: [PATCH 10/11] Add proxy SSO desktop-token login to the login screen
+
+When running behind the local proxy (ProxyUpstreamSiteURL set), show a button to open SSO on the real server with a desktop_token and an input to paste the resulting /login/desktop?server_token=... URL so the proxy can authenticate independently without keeping a second server configured in the desktop app.
+---
+ .../channels/src/components/login/login.scss  |  54 +++++
+ .../channels/src/components/login/login.tsx   |  67 +++++-
+ .../components/login/proxy_sso_login.test.tsx | 138 +++++++++++
+ .../src/components/login/proxy_sso_login.tsx  | 227 ++++++++++++++++++
+ webapp/channels/src/i18n/ru.json              |   7 +
+ 5 files changed, 491 insertions(+), 2 deletions(-)
+ create mode 100644 webapp/channels/src/components/login/proxy_sso_login.test.tsx
+ create mode 100644 webapp/channels/src/components/login/proxy_sso_login.tsx
+
+diff --git a/webapp/channels/src/components/login/login.scss b/webapp/channels/src/components/login/login.scss
+index e64aebcc..bb0c1c33 100644
+--- a/webapp/channels/src/components/login/login.scss
++++ b/webapp/channels/src/components/login/login.scss
+@@ -130,6 +130,60 @@
+                     margin: 20px 0 10px;
+                 }
+ 
++                .login-body-card-proxy-sso {
++                    margin-top: 16px;
++
++                    .login-body-card-proxy-sso-hint {
++                        margin: 0 0 14px;
++                        color: rgba(var(--center-channel-color-rgb), 0.75);
++                        font-size: 13px;
++                        line-height: 19px;
++                    }
++
++                    .login-body-card-proxy-sso-buttons {
++                        display: flex;
++                        flex-wrap: wrap;
++                        gap: 8px;
++                    }
++
++                    .login-body-card-proxy-sso-open {
++                        @include mixins.primary-button;
++                        @include mixins.button-medium;
++
++                        flex: 1 1 auto;
++                    }
++
++                    .login-body-card-proxy-sso-secondary {
++                        @include mixins.tertiary-button;
++                        @include mixins.button-medium;
++                    }
++
++                    .login-body-card-proxy-sso-banner {
++                        margin: 12px 0 0;
++                    }
++
++                    .login-body-card-proxy-sso-form {
++                        margin-top: 14px;
++                    }
++
++                    .login-body-card-proxy-sso-submit {
++                        @include mixins.primary-button;
++                        @include mixins.button-medium;
++
++                        width: 100%;
++                        margin-top: 12px;
++                    }
++
++                    .login-body-card-proxy-sso-footer {
++                        margin-top: 10px;
++                        font-size: 12px;
++
++                        a {
++                            @include mixins.link;
++                        }
++                    }
++                }
++
+                 .login-body-card-form {
+                     .login-body-card-form-input {
+                         margin-top: 22px;
+diff --git a/webapp/channels/src/components/login/login.tsx b/webapp/channels/src/components/login/login.tsx
+index b8d736ed..cb63e544 100644
+--- a/webapp/channels/src/components/login/login.tsx
++++ b/webapp/channels/src/components/login/login.tsx
+@@ -9,6 +9,7 @@ import {useIntl} from 'react-intl';
+ import {useSelector, useDispatch} from 'react-redux';
+ import {Link, useLocation, useHistory, Route} from 'react-router-dom';
+ 
++import type {ClientConfig} from '@mattermost/types/config';
+ import type {Team} from '@mattermost/types/teams';
+ 
+ import {loadMe} from 'mattermost-redux/actions/users';
+@@ -57,6 +58,7 @@ import {setCSRFFromCookie} from 'utils/utils';
+ import type {GlobalState} from 'types/store';
+ 
+ import LoginMfa from './login_mfa';
++import ProxySsoLogin from './proxy_sso_login';
+ 
+ import './login.scss';
+ 
+@@ -76,6 +78,10 @@ const Login = ({onCustomizeHeader}: LoginProps) => {
+     const extraParam = searchParam.get('extra');
+     const emailParam = searchParam.get('email');
+ 
++    const config = useSelector(getConfig) as Partial<ClientConfig> & {
++        ProxyUpstreamSiteURL?: string;
++        ProxySsoProviders?: string;
++    };
+     const {
+         EnableLdap,
+         EnableSaml,
+@@ -101,7 +107,9 @@ const Login = ({onCustomizeHeader}: LoginProps) => {
+         ExperimentalPrimaryTeam,
+         ForgotPasswordLink,
+         PasswordEnableForgotLink,
+-    } = useSelector(getConfig);
++        ProxyUpstreamSiteURL,
++        ProxySsoProviders,
++    } = config;
+     const {IsLicensed} = useSelector(getLicense);
+     const initializing = useSelector((state: GlobalState) => state.requests.users.logout.status === RequestStatus.SUCCESS || !state.storage.initialized);
+     const currentUser = useSelector(getCurrentUser);
+@@ -142,6 +150,44 @@ const Login = ({onCustomizeHeader}: LoginProps) => {
+ 
+     const enableBaseLogin = enableSignInWithEmail || enableSignInWithUsername || ldapEnabled;
+     const enableExternalSignup = enableSignUpWithGitLab || enableSignUpWithOffice365 || enableSignUpWithGoogle || enableSignUpWithOpenId || enableSignUpWithSaml;
++    const proxyUpstreamSiteURL = (ProxyUpstreamSiteURL ?? '').replace(/\/+$/, '');
++    const proxySsoProviders = (() => {
++        if (ProxySsoProviders) {
++            try {
++                const parsed = JSON.parse(ProxySsoProviders);
++                if (Array.isArray(parsed)) {
++                    const valid = parsed.filter((item): item is {label: string; path: string} => (
++                        typeof item?.label === 'string' &&
++                        typeof item?.path === 'string' &&
++                        item.path.startsWith('/') &&
++                        !item.path.startsWith('//')
++                    ));
++                    if (valid.length > 0) {
++                        return valid;
++                    }
++                }
++            } catch {
++                // Ignore malformed proxy config and fall back to server flags.
++            }
++        }
++        const detected: Array<{label: string; path: string}> = [];
++        if (enableSignUpWithGitLab) {
++            detected.push({label: GitLabButtonText || 'GitLab', path: '/oauth/gitlab/login'});
++        }
++        if (enableSignUpWithGoogle) {
++            detected.push({label: 'Google', path: '/oauth/google/login'});
++        }
++        if (enableSignUpWithOffice365) {
++            detected.push({label: 'Entra ID', path: '/oauth/office365/login'});
++        }
++        if (enableSignUpWithOpenId) {
++            detected.push({label: OpenIdButtonText || 'OpenID', path: '/oauth/openid/login'});
++        }
++        if (enableSignUpWithSaml) {
++            detected.push({label: SamlLoginButtonText || 'SAML', path: '/login/sso/saml'});
++        }
++        return detected;
++    })();
+     const showSignup = enableOpenServer && (enableExternalSignup || enableSignUpWithEmail || enableLdap);
+     const onlyLdapEnabled = enableLdap && !(enableSaml || enableSignInWithEmail || enableSignInWithUsername || enableSignUpWithEmail || enableSignUpWithGitLab || enableSignUpWithGoogle || enableSignUpWithOffice365 || enableSignUpWithOpenId);
+ 
+@@ -840,7 +886,7 @@ const Login = ({onCustomizeHeader}: LoginProps) => {
+             );
+         }
+ 
+-        if (!enableBaseLogin && !enableExternalSignup) {
++        if (!enableBaseLogin && !enableExternalSignup && !proxyUpstreamSiteURL) {
+             return (
+                 <ColumnLayout
+                     title={formatMessage({id: 'login.noMethods.title', defaultMessage: 'This server doesn’t have any sign-in methods enabled'})}
+@@ -908,6 +954,23 @@ const Login = ({onCustomizeHeader}: LoginProps) => {
+                                     onDismiss={alertBanner.onDismiss ?? dismissAlert}
+                                 />
+                             )}
++                            {proxyUpstreamSiteURL && (
++                                <>
++                                    <ProxySsoLogin
++                                        upstreamSiteUrl={proxyUpstreamSiteURL}
++                                        providers={proxySsoProviders}
++                                        onLogin={postSubmit}
++                                        onInteraction={onDismissSessionExpired}
++                                    />
++                                    {(enableBaseLogin || enableExternalSignup) && (
++                                        <div className='login-body-card-form-divider'>
++                                            <span className='login-body-card-form-divider-label'>
++                                                {formatMessage({id: 'login.or', defaultMessage: 'or log in with'})}
++                                            </span>
++                                        </div>
++                                    )}
++                                </>
++                            )}
+                             {enableBaseLogin && (
+                                 <form
+                                     onSubmit={(event: FormEvent<HTMLFormElement>) => {
+diff --git a/webapp/channels/src/components/login/proxy_sso_login.test.tsx b/webapp/channels/src/components/login/proxy_sso_login.test.tsx
+new file mode 100644
+index 00000000..fbb6337f
+--- /dev/null
++++ b/webapp/channels/src/components/login/proxy_sso_login.test.tsx
+@@ -0,0 +1,138 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import React from 'react';
++
++import {RequestStatus} from 'mattermost-redux/constants';
++
++import * as loginActions from 'actions/views/login';
++
++import Login from 'components/login/login';
++import {buildProxySsoUrl, extractDesktopServerToken} from 'components/login/proxy_sso_login';
++
++import {renderWithContext, screen, userEvent, waitFor} from 'tests/react_testing_utils';
++import {WindowSizes} from 'utils/constants';
++
++import type {GlobalState} from 'types/store';
++
++jest.unmock('react-intl');
++jest.unmock('react-router-dom');
++
++function makeProxyState(config: Record<string, string>) {
++    return {
++        entities: {
++            general: {
++                config,
++                license: {
++                    IsLicensed: 'true',
++                },
++            },
++            users: {
++                currentUserId: '',
++                profiles: {},
++            },
++            teams: {
++                currentTeamId: '',
++                teams: {},
++                myMembers: {},
++            },
++        },
++        requests: {
++            users: {
++                logout: {status: RequestStatus.NOT_STARTED},
++            },
++        },
++        storage: {
++            initialized: true,
++        },
++        views: {
++            browser: {windowSize: WindowSizes.DESKTOP_VIEW},
++        },
++    } as unknown as GlobalState;
++}
++
++describe('ProxySsoLogin', () => {
++    describe('extractDesktopServerToken', () => {
++        it('extracts server_token from https and mattermost URLs', () => {
++            expect(extractDesktopServerToken('https://chat.example/login/desktop?server_token=abc123&client_token=xyz')).toBe('abc123');
++            expect(extractDesktopServerToken('mattermost://chat.example/login/desktop?client_token=xyz&server_token=tok999')).toBe('tok999');
++            expect(extractDesktopServerToken('?server_token=onlyquery')).toBe('onlyquery');
++        });
++
++        it('accepts a raw token and rejects invalid inputs', () => {
++            expect(extractDesktopServerToken('  rawtoken123  ')).toBe('rawtoken123');
++            expect(extractDesktopServerToken('')).toBe('');
++            expect(extractDesktopServerToken('https://chat.example/login/desktop?client_token=xyz')).toBe('');
++            expect(extractDesktopServerToken('not a token')).toBe('');
++        });
++    });
++
++    describe('buildProxySsoUrl', () => {
++        it('points at the real upstream host with desktop_token', () => {
++            expect(buildProxySsoUrl('https://chat.example/', '/oauth/gitlab/login', 'abc')).toBe('https://chat.example/oauth/gitlab/login?desktop_token=abc');
++        });
++    });
++
++    describe('rendered in Login behind the local proxy', () => {
++        it('auto-detects standard SSO providers and submits the pasted desktop URL', async () => {
++            const openSpy = jest.spyOn(window, 'open').mockImplementation(() => null);
++            const loginSpy = jest.spyOn(loginActions, 'loginWithDesktopToken').mockReturnValue((() => Promise.resolve({error: {message: 'expired'}})) as never);
++
++            renderWithContext(<Login/>, makeProxyState({
++                ProxyUpstreamSiteURL: 'https://chat.example',
++                EnableSignInWithEmail: 'true',
++                EnableSignUpWithGitLab: 'true',
++                SiteName: 'Acme Chat',
++            }));
++
++            expect(screen.getByTestId('proxy-sso-login')).toBeVisible();
++            screen.getByRole('button', {name: /Open SSO on chat\.example/}).click();
++            expect(openSpy).toHaveBeenCalledWith(
++                expect.stringMatching(/^https:\/\/chat\.example\/oauth\/gitlab\/login\?desktop_token=[0-9a-f]{64}$/),
++                '_blank',
++                'noopener',
++            );
++
++            const input = screen.getByTestId('proxy-sso-token-input');
++            userEvent.type(input, 'https://chat.example/login/desktop?server_token=srv123&client_token=cli');
++            screen.getByRole('button', {name: 'Log in with token'}).click();
++
++            await waitFor(() => {
++                expect(loginSpy).toHaveBeenCalledWith('srv123');
++            });
++            expect(await screen.findByText(/The token was rejected or has expired/)).toBeVisible();
++
++            openSpy.mockRestore();
++            loginSpy.mockRestore();
++        });
++
++        it('renders custom providers configured via ProxySsoProviders', () => {
++            const openSpy = jest.spyOn(window, 'open').mockImplementation(() => null);
++
++            renderWithContext(<Login/>, makeProxyState({
++                ProxyUpstreamSiteURL: 'https://chat.example',
++                ProxySsoProviders: JSON.stringify([
++                    {label: 'Corp SSO', path: '/oauth/openid/login'},
++                    {label: 'Partner Login', path: '/oauth/partner/login'},
++                ]),
++                SiteName: 'Acme Chat',
++            }));
++
++            screen.getByRole('button', {name: 'Corp SSO'}).click();
++            expect(openSpy).toHaveBeenCalledWith(
++                expect.stringMatching(/^https:\/\/chat\.example\/oauth\/openid\/login\?desktop_token=[0-9a-f]{64}$/),
++                '_blank',
++                'noopener',
++            );
++
++            screen.getByRole('button', {name: 'Partner Login'}).click();
++            expect(openSpy).toHaveBeenLastCalledWith(
++                expect.stringMatching(/^https:\/\/chat\.example\/oauth\/partner\/login\?desktop_token=[0-9a-f]{64}$/),
++                '_blank',
++                'noopener',
++            );
++
++            openSpy.mockRestore();
++        });
++    });
++});
+diff --git a/webapp/channels/src/components/login/proxy_sso_login.tsx b/webapp/channels/src/components/login/proxy_sso_login.tsx
+new file mode 100644
+index 00000000..eb57d45e
+--- /dev/null
++++ b/webapp/channels/src/components/login/proxy_sso_login.tsx
+@@ -0,0 +1,227 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import React, {useRef, useState} from 'react';
++import type {FormEvent} from 'react';
++import {useIntl} from 'react-intl';
++import {useDispatch} from 'react-redux';
++
++import {loginWithDesktopToken} from 'actions/views/login';
++
++import AlertBanner from 'components/alert_banner';
++import SaveButton from 'components/save_button';
++import Input, {SIZE} from 'components/widgets/inputs/input/input';
++
++export type ProxySsoProvider = {
++    label: string;
++    path: string;
++};
++
++type Props = {
++    upstreamSiteUrl: string;
++    providers: ProxySsoProvider[];
++    onLogin: () => Promise<void>;
++    onInteraction?: () => void;
++};
++
++export function extractDesktopServerToken(raw: string): string {
++    const trimmed = raw.trim();
++    if (!trimmed) {
++        return '';
++    }
++    if (trimmed.includes('server_token=')) {
++        try {
++            const parsed = new URL(trimmed);
++            const token = parsed.searchParams.get('server_token');
++            if (token) {
++                return token.trim();
++            }
++        } catch {
++            // Fall through to query-string parsing for non-standard or partial URLs.
++        }
++        const queryStart = trimmed.indexOf('?');
++        const params = new URLSearchParams(queryStart >= 0 ? trimmed.slice(queryStart + 1) : trimmed);
++        return (params.get('server_token') ?? '').trim();
++    }
++    if (/[\s/?#]/.test(trimmed)) {
++        return '';
++    }
++    return trimmed;
++}
++
++export function generateDesktopClientToken(): string {
++    const bytes = new Uint8Array(32);
++    if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
++        window.crypto.getRandomValues(bytes);
++    } else {
++        for (let i = 0; i < bytes.length; i++) {
++            bytes[i] = Math.floor(Math.random() * 256);
++        }
++    }
++    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
++}
++
++export function buildProxySsoUrl(upstreamSiteUrl: string, oauthPath: string, desktopToken: string): string {
++    const base = upstreamSiteUrl.replace(/\/+$/, '');
++    return `${base}${oauthPath}?desktop_token=${encodeURIComponent(desktopToken)}`;
++}
++
++function hostOf(url: string): string {
++    try {
++        return new URL(url).host;
++    } catch {
++        return url;
++    }
++}
++
++const ProxySsoLogin: React.FC<Props> = ({upstreamSiteUrl, providers, onLogin, onInteraction}) => {
++    const {formatMessage} = useIntl();
++    const dispatch = useDispatch();
++    const inputRef = useRef<HTMLInputElement>(null);
++
++    const [tokenInput, setTokenInput] = useState('');
++    const [isWaiting, setIsWaiting] = useState(false);
++    const [errorMessage, setErrorMessage] = useState<string | null>(null);
++
++    const host = hostOf(upstreamSiteUrl);
++
++    const openSsoInBrowser = (oauthPath: string) => {
++        onInteraction?.();
++        setErrorMessage(null);
++        const url = buildProxySsoUrl(upstreamSiteUrl, oauthPath, generateDesktopClientToken());
++        window.open(url, '_blank', 'noopener');
++        inputRef.current?.focus();
++    };
++
++    const handleSubmit = async (e: FormEvent | React.MouseEvent) => {
++        e.preventDefault();
++        onInteraction?.();
++        setErrorMessage(null);
++
++        const rawValue = inputRef.current?.value ?? tokenInput;
++        const serverToken = extractDesktopServerToken(rawValue);
++        if (!serverToken) {
++            setErrorMessage(formatMessage({
++                id: 'login.proxy_sso.empty_token',
++                defaultMessage: 'Paste the final browser URL containing server_token=... or the token itself.',
++            }));
++            inputRef.current?.focus();
++            return;
++        }
++
++        setIsWaiting(true);
++        const {error: loginError} = await dispatch(loginWithDesktopToken(serverToken));
++        if (loginError) {
++            setIsWaiting(false);
++            setErrorMessage(formatMessage({
++                id: 'login.proxy_sso.invalid_token',
++                defaultMessage: 'The token was rejected or has expired. Open SSO again and paste the new URL.',
++            }));
++            inputRef.current?.focus();
++            return;
++        }
++
++        await onLogin();
++    };
++
++    return (
++        <div
++            className='login-body-card-proxy-sso'
++            data-testid='proxy-sso-login'
++        >
++            <p className='login-body-card-proxy-sso-hint'>
++                {formatMessage(
++                    {
++                        id: 'login.proxy_sso.hint',
++                        defaultMessage: 'Log in via {host} in your browser (no need to keep a second server in the app), then paste the final address bar URL with server_token=... below.',
++                    },
++                    {host},
++                )}
++            </p>
++            {providers.length > 0 && (
++                <div className='login-body-card-proxy-sso-buttons'>
++                    {providers.map((provider, index) => (
++                        <button
++                            key={`${provider.path}:${provider.label}`}
++                            type='button'
++                            className={index === 0 ? 'btn btn-primary login-body-card-proxy-sso-open' : 'btn btn-tertiary login-body-card-proxy-sso-secondary'}
++                            disabled={isWaiting}
++                            onClick={() => openSsoInBrowser(provider.path)}
++                        >
++                            {providers.length === 1
++                                ? formatMessage(
++                                    {
++                                        id: 'login.proxy_sso.open_button',
++                                        defaultMessage: '1. Open SSO on {host}',
++                                    },
++                                    {host},
++                                )
++                                : provider.label}
++                        </button>
++                    ))}
++                </div>
++            )}
++            {errorMessage && (
++                <AlertBanner
++                    id='proxy-sso-error-banner'
++                    className='login-body-card-proxy-sso-banner'
++                    mode='danger'
++                    title={errorMessage}
++                    onDismiss={() => setErrorMessage(null)}
++                />
++            )}
++            <form
++                className='login-body-card-proxy-sso-form'
++                onSubmit={handleSubmit}
++            >
++                <Input
++                    data-testid='proxy-sso-token-input'
++                    ref={inputRef}
++                    name='proxyDesktopToken'
++                    containerClassName='login-body-card-proxy-sso-input'
++                    type='text'
++                    inputSize={SIZE.LARGE}
++                    value={tokenInput}
++                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
++                        setTokenInput(e.target.value);
++                        if (errorMessage) {
++                            setErrorMessage(null);
++                        }
++                    }}
++                    hasError={Boolean(errorMessage)}
++                    placeholder={formatMessage(
++                        {
++                            id: 'login.proxy_sso.placeholder',
++                            defaultMessage: '2. Paste {host}/login/desktop?server_token=... or token',
++                        },
++                        {host},
++                    )}
++                    disabled={isWaiting}
++                />
++                <SaveButton
++                    extraClasses='login-body-card-proxy-sso-submit large'
++                    saving={isWaiting}
++                    onClick={handleSubmit}
++                    defaultMessage={formatMessage({
++                        id: 'login.proxy_sso.submit',
++                        defaultMessage: 'Log in with token',
++                    })}
++                    savingMessage={formatMessage({
++                        id: 'login.logingIn',
++                        defaultMessage: 'Logging in…',
++                    })}
++                />
++            </form>
++            <div className='login-body-card-proxy-sso-footer'>
++                <a href='/__auth'>
++                    {formatMessage({
++                        id: 'login.proxy_sso.fallback_link',
++                        defaultMessage: 'Bookmarklet / manual cookie paste (/__auth)',
++                    })}
++                </a>
++            </div>
++        </div>
++    );
++};
++
++export default ProxySsoLogin;
+diff --git a/webapp/channels/src/i18n/ru.json b/webapp/channels/src/i18n/ru.json
+index 84a5aacc..18e15ef5 100644
+--- a/webapp/channels/src/i18n/ru.json
++++ b/webapp/channels/src/i18n/ru.json
+@@ -4122,6 +4122,13 @@
+   "login.or": "или войти в систему с помощью",
+   "login.passwordChanged": " Пароль успешно обновлён",
+   "login.placeholderOr": " или ",
++  "login.proxy_sso.empty_token": "Вставьте итоговую ссылку из браузера с server_token=... или сам токен.",
++  "login.proxy_sso.fallback_link": "Закладка в браузер / ручной ввод кук (/__auth)",
++  "login.proxy_sso.hint": "Откройте вход на {host} в браузере (второй сервер в приложении держать не нужно), затем вставьте сюда итоговую ссылку из адресной строки с server_token=...",
++  "login.proxy_sso.invalid_token": "Сервер отклонил токен или он истёк. Откройте SSO заново и вставьте новую ссылку.",
++  "login.proxy_sso.open_button": "1. Открыть SSO на {host}",
++  "login.proxy_sso.placeholder": "2. Вставьте ссылку {host}/login/desktop?server_token=... или токен",
++  "login.proxy_sso.submit": "Войти по ссылке / токену",
+   "login.saml": "SAML",
+   "login.session_expired": "Сессия истекла. Пожалуйста, войдите заново.",
+   "login.session_expired.notification": "Сессия истекла: войдите, чтобы продолжить получение уведомлений.",

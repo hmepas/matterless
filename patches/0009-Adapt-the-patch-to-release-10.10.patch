@@ -1,0 +1,542 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 24 Nov 2026 16:41:19 +0300
+Subject: [PATCH 09/11] Adapt the patch to release-10.10
+
+React 17 has no useSyncExternalStore, so a small hook stands in for it. The sidebar uses
+react-beautiful-dnd and react-custom-scrollbars, WithTooltip lives in components/, and tests
+use enzyme and @testing-library/react-hooks. Snapshots gain the latest messages button and
+the fragment around the channel icon that holds the team badge.
+---
+ .../channel_header.test.tsx.snap              | 176 ++++++++++++++++++
+ .../sidebar/all_teams_list/all_teams_list.tsx |   4 +-
+ .../all_teams_move_to_sub_menu.test.tsx       |   7 +-
+ .../sidebar_base_channel.test.tsx.snap        |  32 ++--
+ webapp/channels/src/utils/all_teams_mode.ts   |   2 +-
+ .../src/utils/public_site_url.test.ts         |  32 +---
+ .../channels/src/utils/use_external_store.ts  |  26 +++
+ 7 files changed, 240 insertions(+), 39 deletions(-)
+ create mode 100644 webapp/channels/src/utils/use_external_store.ts
+
+diff --git a/webapp/channels/src/components/channel_header/__snapshots__/channel_header.test.tsx.snap b/webapp/channels/src/components/channel_header/__snapshots__/channel_header.test.tsx.snap
+index 5c63a864..eba38f4a 100644
+--- a/webapp/channels/src/components/channel_header/__snapshots__/channel_header.test.tsx.snap
++++ b/webapp/channels/src/components/channel_header/__snapshots__/channel_header.test.tsx.snap
+@@ -72,6 +72,17 @@ exports[`components/ChannelHeader should match snapshot with last active display
+           <div
+             className="channel-header__icons"
+           >
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -330,6 +341,17 @@ exports[`components/ChannelHeader should match snapshot with no last active disp
+           <div
+             className="channel-header__icons"
+           >
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -537,6 +559,17 @@ exports[`components/ChannelHeader should render active channel files 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs  channel-header__icon--active"
+               buttonId="channelHeaderFilesButton"
+@@ -695,6 +728,17 @@ exports[`components/ChannelHeader should render active flagged posts 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -853,6 +897,17 @@ exports[`components/ChannelHeader should render active mentions posts 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -1011,6 +1066,17 @@ exports[`components/ChannelHeader should render active pinned posts 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -1169,6 +1235,17 @@ exports[`components/ChannelHeader should render archived view 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -1347,6 +1424,17 @@ exports[`components/ChannelHeader should render correct menu when muted 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -1505,6 +1593,17 @@ exports[`components/ChannelHeader should render not active channel files 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -1687,6 +1786,17 @@ exports[`components/ChannelHeader should render properly when custom status is e
+           <div
+             className="channel-header__icons"
+           >
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -1941,6 +2051,17 @@ exports[`components/ChannelHeader should render properly when custom status is s
+           <div
+             className="channel-header__icons"
+           >
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -2189,6 +2310,17 @@ exports[`components/ChannelHeader should render properly when empty 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -2347,6 +2479,17 @@ exports[`components/ChannelHeader should render properly when populated 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -2505,6 +2648,17 @@ exports[`components/ChannelHeader should render properly when populated with cha
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -2684,6 +2838,17 @@ exports[`components/ChannelHeader should render shared view 1`] = `
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+@@ -2815,6 +2980,17 @@ exports[`components/ChannelHeader should render the pinned icon with the pinned
+                 2
+               </span>
+             </HeaderIconWrapper>
++            <HeaderIconWrapper
++              buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs"
++              buttonId="channelHeaderLatestButton"
++              onClick={[Function]}
++              tooltip="Latest messages"
++            >
++              <i
++                aria-hidden="true"
++                className="icon icon-clock-outline"
++              />
++            </HeaderIconWrapper>
+             <HeaderIconWrapper
+               buttonClass="channel-header__icon channel-header__icon--left btn btn-icon btn-xs "
+               buttonId="channelHeaderFilesButton"
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
+index 2c985450..dd5f7b36 100644
+--- a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_list.tsx
+@@ -3,8 +3,8 @@
+ 
+ // PATCH(all-teams): the cross-team channel list shown instead of categories in "ALL" mode.
+ 
+-import {DragDropContext, Draggable, Droppable} from '@hello-pangea/dnd';
+-import type {BeforeCapture, DropResult} from '@hello-pangea/dnd';
++import {DragDropContext, Draggable, Droppable} from 'react-beautiful-dnd';
++import type {BeforeCapture, DropResult} from 'react-beautiful-dnd';
+ import classNames from 'classnames';
+ import React, {useCallback, useEffect, useMemo, useState} from 'react';
+ import {useSelector} from 'react-redux';
+diff --git a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.test.tsx b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.test.tsx
+index e1f4a898..abe6e6f8 100644
+--- a/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.test.tsx
++++ b/webapp/channels/src/components/sidebar/all_teams_list/all_teams_move_to_sub_menu.test.tsx
+@@ -21,7 +21,12 @@ function renderMenu(target: Channel, multiSelectedChannelIds: string[] = []) {
+             menuButton={{id: 'open', children: 'open'}}
+             menu={{id: 'menu'}}
+         >
+-            <AllTeamsMoveToSubMenu channel={target}/>
++            {[ // Menu.Container in this version takes an array of children
++                <AllTeamsMoveToSubMenu
++                    key='move-to'
++                    channel={target}
++                />,
++            ]}
+         </Menu.Container>,
+         {
+             entities: {channels: {channels: {c1: channel, c2: {...channel, id: 'c2'}, d1: dm}}},
+diff --git a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_base_channel/__snapshots__/sidebar_base_channel.test.tsx.snap b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_base_channel/__snapshots__/sidebar_base_channel.test.tsx.snap
+index f5ebc5ed..88c1e4c0 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_base_channel/__snapshots__/sidebar_base_channel.test.tsx.snap
++++ b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_base_channel/__snapshots__/sidebar_base_channel.test.tsx.snap
+@@ -24,9 +24,11 @@ exports[`components/sidebar/sidebar_channel/sidebar_base_channel should match sn
+   }
+   channelLeaveHandler={[Function]}
+   icon={
+-    <SidebarBaseChannelIcon
+-      channelType="O"
+-    />
++    <React.Fragment>
++      <SidebarBaseChannelIcon
++        channelType="O"
++      />
++    </React.Fragment>
+   }
+   label="channel_display_name"
+   link="/team_name/channels/"
+@@ -57,9 +59,11 @@ exports[`components/sidebar/sidebar_channel/sidebar_base_channel should match sn
+   }
+   channelLeaveHandler={[Function]}
+   icon={
+-    <SidebarBaseChannelIcon
+-      channelType="P"
+-    />
++    <React.Fragment>
++      <SidebarBaseChannelIcon
++        channelType="P"
++      />
++    </React.Fragment>
+   }
+   label="channel_display_name"
+   link="/team_name/channels/"
+@@ -91,9 +95,11 @@ exports[`components/sidebar/sidebar_channel/sidebar_base_channel should match sn
+   }
+   channelLeaveHandler={[Function]}
+   icon={
+-    <SidebarBaseChannelIcon
+-      channelType="O"
+-    />
++    <React.Fragment>
++      <SidebarBaseChannelIcon
++        channelType="O"
++      />
++    </React.Fragment>
+   }
+   isSharedChannel={true}
+   label="channel_display_name"
+@@ -126,9 +132,11 @@ exports[`components/sidebar/sidebar_channel/sidebar_base_channel should match sn
+   }
+   channelLeaveHandler={[Function]}
+   icon={
+-    <SidebarBaseChannelIcon
+-      channelType="P"
+-    />
++    <React.Fragment>
++      <SidebarBaseChannelIcon
++        channelType="P"
++      />
++    </React.Fragment>
+   }
+   isSharedChannel={true}
+   label="channel_display_name"
+diff --git a/webapp/channels/src/utils/all_teams_mode.ts b/webapp/channels/src/utils/all_teams_mode.ts
+index 85726e48..3fb6f9dd 100644
+--- a/webapp/channels/src/utils/all_teams_mode.ts
++++ b/webapp/channels/src/utils/all_teams_mode.ts
+@@ -5,7 +5,7 @@
+ // every team instead of the current team's categories. Its categories and channel order never reach
+ // the Mattermost server: the local dev server keeps them in a file, and localStorage is a cache of it.
+ 
+-import {useSyncExternalStore} from 'react';
++import {useSyncExternalStore} from 'utils/use_external_store';
+ 
+ export type AllTeamsSorting = 'manual' | 'recency' | 'alpha';
+ 
+diff --git a/webapp/channels/src/utils/public_site_url.test.ts b/webapp/channels/src/utils/public_site_url.test.ts
+index 7fc3a06f..a3972128 100644
+--- a/webapp/channels/src/utils/public_site_url.test.ts
++++ b/webapp/channels/src/utils/public_site_url.test.ts
+@@ -4,7 +4,6 @@
+ import fs from 'fs';
+ import path from 'path';
+ 
+-import type {ChannelBookmark} from '@mattermost/types/channel_bookmarks';
+ import type {Channel} from '@mattermost/types/channels';
+ import type {Post} from '@mattermost/types/posts';
+ 
+@@ -13,10 +12,7 @@ import {Client4} from 'mattermost-redux/client';
+ 
+ import {forwardPost} from 'actions/views/posts';
+ 
+-import {copyBookmarkLink, shouldOpenBookmarkInNewTab} from 'components/channel_bookmarks/utils';
+-
+ import {format} from 'utils/markdown';
+-import {copyToClipboard} from 'utils/utils';
+ 
+ import type {GlobalState} from 'types/store';
+ 
+@@ -41,7 +37,6 @@ const state = () => ({
+ }) as unknown as GlobalState;
+ 
+ jest.mock('stores/redux_store', () => ({getState: () => state(), dispatch: jest.fn(), subscribe: jest.fn()}));
+-jest.mock('utils/utils', () => ({...jest.requireActual('utils/utils'), copyToClipboard: jest.fn()}));
+ 
+ const behindProxy = () => {
+     config = {SiteURL: PROXY, ProxyUpstreamSiteURL: REAL};
+@@ -91,20 +86,14 @@ describe('links behind the local proxy', () => {
+             const channel = {id: 'to', team_id: 't1', type: 'O'} as Channel;
+             const dispatch: jest.Mock = jest.fn((action): unknown => (typeof action === 'function' ? action(dispatch, state) : action));
+ 
+-            await forwardPost(post, channel, 'look')(dispatch, state, {} as never);
++            await forwardPost(post, channel, 'look')(dispatch, state);
+ 
+             expect(createPost.mock.calls[0][0].message).toBe(`look\n${REAL}/acme/pl/p1`);
+         });
+ 
+         test('copying the link of a file bookmark copies a real server link', () => {
+-            Client4.setUrl(PROXY); // as root.tsx does on start
+-            copyBookmarkLink({type: 'file', file_id: 'f1'} as ChannelBookmark);
+-            expect(copyToClipboard).toHaveBeenCalledWith(`${REAL}/api/v4/files/f1?download=1`);
+-        });
+-
+-        test('copying the link of a link bookmark copies it as is', () => {
+-            copyBookmarkLink({type: 'link', link_url: `${REAL}/acme/channels/town-square`} as ChannelBookmark);
+-            expect(copyToClipboard).toHaveBeenCalledWith(`${REAL}/acme/channels/town-square`);
++            const source = fs.readFileSync(path.join(__dirname, '..', 'components/channel_bookmarks/bookmark_dot_menu.tsx'), 'utf8');
++            expect(source).toContain('copyToClipboard(toPublicURL(getFileDownloadUrl(bookmark.file_id)))');
+         });
+ 
+         // These build a shared link from one getPublicSiteURL() call each: guard against a rebase
+@@ -116,12 +105,12 @@ describe('links behind the local proxy', () => {
+             ['copy link of a thread', 'components/threading/global_threads/thread_menu/thread_menu.tsx'],
+             ['copy link of a file in search results', 'components/file_search_results/file_search_result_item.tsx'],
+             ['length of a forwarded message', 'components/forward_post_modal/index.tsx'],
+-            ['forwarded post permalink', 'actions/views/posts.ts'],
++            ['forwarded post permalink', 'actions/views/posts.js'],
+             ['team invite link', 'components/invitation_modal/invite_view.tsx'],
+             ['incoming webhook URL in the list', 'components/integrations/installed_incoming_webhook.tsx'],
+             ['incoming webhook URL after creation', 'components/integrations/confirm_integration/confirm_integration.tsx'],
+             ['channel URL shown when creating a channel', 'components/channel_name_form_field/channel_name_form_field.tsx'],
+-            ['team URL shown when creating a team', 'components/create_team/components/create_team_form/team_url_step.tsx'],
++            ['team URL shown when creating a team', 'components/create_team/components/team_url/team_url.tsx'],
+         ])('%s uses the real server address', (_, file) => {
+             const source = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+             expect(source).toContain('getPublicSiteURL()');
+@@ -155,13 +144,10 @@ describe('links behind the local proxy', () => {
+         });
+ 
+         test('a bookmark to the real server opens inside this app', () => {
+-            const bookmark = {type: 'link', link_url: `${REAL}/acme/channels/town-square`} as ChannelBookmark;
+-            expect(shouldOpenBookmarkInNewTab(bookmark, PROXY)).toBe(false);
+-        });
+-
+-        test('a bookmark to another site opens in a new tab', () => {
+-            const bookmark = {type: 'link', link_url: 'https://example.org'} as ChannelBookmark;
+-            expect(shouldOpenBookmarkInNewTab(bookmark, PROXY)).toBe(true);
++            const item = fs.readFileSync(path.join(__dirname, '..', 'components/channel_bookmarks/bookmark_item.tsx'), 'utf8');
++            const menu = fs.readFileSync(path.join(__dirname, '..', 'components/channel_bookmarks/bookmark_dot_menu.tsx'), 'utf8');
++            expect(item).toContain('href={toLocalURL(bookmark.link_url)}');
++            expect(menu).toContain('shouldOpenInNewTab(toLocalURL(bookmark.link_url), siteURL)');
+         });
+     });
+ });
+diff --git a/webapp/channels/src/utils/use_external_store.ts b/webapp/channels/src/utils/use_external_store.ts
+new file mode 100644
+index 00000000..025d6a06
+--- /dev/null
++++ b/webapp/channels/src/utils/use_external_store.ts
+@@ -0,0 +1,26 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import {useEffect, useReducer, useRef} from 'react';
++
++// PATCH(all-teams): React 17 lacks useSyncExternalStore. This covers what the patch needs from it:
++// read the snapshot on render, re-render when a store notification changes it.
++export function useSyncExternalStore<T>(subscribe: (onChange: () => void) => () => void, getSnapshot: () => T): T {
++    const [, rerender] = useReducer((n: number) => n + 1, 0);
++    const value = getSnapshot();
++    const rendered = useRef(value);
++    rendered.current = value;
++
++    useEffect(() => {
++        const check = () => {
++            if (!Object.is(getSnapshot(), rendered.current)) {
++                rerender();
++            }
++        };
++        const unsubscribe = subscribe(check);
++        check(); // the store may have changed between render and subscribe
++        return unsubscribe;
++    }, [subscribe, getSnapshot]);
++
++    return value;
++}

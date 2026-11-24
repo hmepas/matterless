@@ -1,0 +1,29 @@
+# Secrets: session cookies for the real server
+session.env
+session.json
+*.env
+.env
+.env.*
+!*.example
+
+# Half-written layout file
+*.tmp
+
+# Logs from installs, typechecks and dev-server runs
+*.log
+
+# Build artifacts and dependencies
+node_modules/
+dist/
+dist.*/
+.parcel-cache/
+.eslintcache
+*.tsbuildinfo
+
+# Upstream Mattermost clone with the patch: a separate git repo
+src/
+
+# ALL-mode categories and order: never let a checkout of an old commit overwrite them
+all-teams-layout.json
+
+.DS_Store

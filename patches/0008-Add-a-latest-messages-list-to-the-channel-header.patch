@@ -1,0 +1,545 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Wed, 18 Nov 2026 14:16:52 +0300
+Subject: [PATCH 08/11] Add a latest messages list to the channel header
+
+A clock button opens the channel's latest 60 messages in the right panel as one list by time,
+newest first: root posts and replies to any thread, followed or not. It reuses the pinned messages
+list, so each message has jump and reply, and it follows the user to another channel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../channels/src/actions/global_actions.tsx   |   6 +
+ .../src/actions/views/channel_latest.test.ts  | 134 ++++++++++++++++++
+ .../src/actions/views/channel_latest.ts       |  60 ++++++++
+ webapp/channels/src/actions/views/rhs.ts      |   1 +
+ .../channel_header/channel_header.test.tsx    |  27 ++++
+ .../channel_header/channel_header.tsx         |  21 +++
+ .../src/components/channel_header/index.ts    |   2 +
+ webapp/channels/src/components/post/index.tsx |   1 +
+ .../rhs_header_post/rhs_header_post.tsx       |   9 ++
+ .../channels/src/components/search/index.tsx  |   2 +-
+ .../search_results/search_results.tsx         |  12 +-
+ webapp/channels/src/i18n/en.json              |   2 +
+ webapp/channels/src/i18n/ru.json              |   2 +
+ webapp/channels/src/reducers/views/rhs.ts     |   1 +
+ webapp/channels/src/utils/constants.tsx       |   3 +
+ 15 files changed, 281 insertions(+), 2 deletions(-)
+ create mode 100644 webapp/channels/src/actions/views/channel_latest.test.ts
+ create mode 100644 webapp/channels/src/actions/views/channel_latest.ts
+
+diff --git a/webapp/channels/src/actions/global_actions.tsx b/webapp/channels/src/actions/global_actions.tsx
+index 395fbca5..3cd58e40 100644
+--- a/webapp/channels/src/actions/global_actions.tsx
++++ b/webapp/channels/src/actions/global_actions.tsx
+@@ -29,6 +29,7 @@ import {calculateUnreadCount} from 'mattermost-redux/utils/channel_utils';
+ 
+ import {handleNewPost} from 'actions/post_actions';
+ import {loadProfilesForSidebar} from 'actions/user_actions';
++import {showChannelLatest} from 'actions/views/channel_latest';
+ import {clearUserCookie} from 'actions/views/cookie';
+ import {close as closeLhs} from 'actions/views/lhs';
+ import {closeRightHandSide, closeMenu as closeRhsMenu, updateRhsState} from 'actions/views/rhs';
+@@ -63,6 +64,7 @@ export function emitChannelClickEvent(channel: Channel) {
+         const isRHSOpened = getIsRhsOpen(state);
+         const isPinnedPostsShowing = getRhsState(state) === RHSStates.PIN;
+         const isChannelFilesShowing = getRhsState(state) === RHSStates.CHANNEL_FILES;
++        const isChannelLatestShowing = getRhsState(state) === RHSStates.CHANNEL_LATEST;
+         const member = getMyChannelMember(state, chan.id);
+         const currentChannelId = getCurrentChannelId(state);
+         const previousRhsState = getPreviousRhsState(state);
+@@ -87,6 +89,10 @@ export function emitChannelClickEvent(channel: Channel) {
+             dispatch(updateRhsState(RHSStates.PIN, chan.id, previousRhsState));
+         }
+ 
++        if (isRHSOpened && isChannelLatestShowing) {
++            dispatch(showChannelLatest(chan.id));
++        }
++
+         if (isRHSOpened && isChannelFilesShowing) {
+             dispatch(updateRhsState(RHSStates.CHANNEL_FILES, chan.id, previousRhsState));
+         }
+diff --git a/webapp/channels/src/actions/views/channel_latest.test.ts b/webapp/channels/src/actions/views/channel_latest.test.ts
+new file mode 100644
+index 00000000..2ec7b5ef
+--- /dev/null
++++ b/webapp/channels/src/actions/views/channel_latest.test.ts
+@@ -0,0 +1,134 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import type {PostList} from '@mattermost/types/posts';
++
++import {SearchTypes} from 'mattermost-redux/action_types';
++import {Client4} from 'mattermost-redux/client';
++
++import {ActionTypes, RHSStates} from 'utils/constants';
++
++import type {GlobalState} from 'types/store';
++
++import {LATEST_POSTS_COUNT, showChannelLatest} from './channel_latest';
++
++jest.mock('mattermost-redux/actions/posts', () => ({
++    receivedPosts: (posts: unknown) => ({type: 'RECEIVED_POSTS', data: posts}),
++    getMentionsAndStatusesForPosts: jest.fn(() => Promise.resolve()),
++}));
++
++// A root post and a reply to an older thread, as the server returns them: newest first.
++const posts: PostList = {
++    order: ['reply', 'root'],
++    posts: {
++        reply: {id: 'reply', channel_id: 'ch1', root_id: 'old_thread', create_at: 2},
++        root: {id: 'root', channel_id: 'ch1', root_id: '', create_at: 1},
++    },
++} as unknown as PostList;
++
++type Rhs = {rhsState: string | null; previousRhsStates: string[]; selectedChannelId: string};
++
++function setup(rhs: Partial<Rhs> = {}) {
++    const current: Rhs = {rhsState: null, previousRhsStates: [], selectedChannelId: '', ...rhs};
++    const actions: Array<{type: string; [key: string]: unknown}> = [];
++    const getState = () => ({
++        entities: {teams: {currentTeamId: 't1'}},
++        views: {rhs: current},
++    }) as unknown as GlobalState;
++    const dispatch = (action: {type: string; payload?: unknown[]; [key: string]: unknown}) => {
++        const list = action.type === 'BATCHING_REDUCER.BATCH' ? action.payload as typeof actions : [action];
++        for (const a of list) {
++            actions.push(a);
++            if (a.type === ActionTypes.UPDATE_RHS_STATE) {
++                current.rhsState = a.state as string;
++                current.selectedChannelId = a.channelId as string;
++            }
++        }
++        return action;
++    };
++    const run = (channelId: string) => showChannelLatest(channelId)(dispatch as never, getState, {} as never);
++    const types = () => actions.map((a) => a.type);
++    const searchResults = () => actions.find((a) => a.type === SearchTypes.RECEIVED_SEARCH_POSTS)?.data;
++    return {current, actions, run, types, searchResults};
++}
++
++describe('latest messages of a channel', () => {
++    afterEach(() => jest.restoreAllMocks());
++
++    test('lists the latest messages, replies to any thread included, newest first', async () => {
++        const getPosts = jest.spyOn(Client4, 'getPosts').mockResolvedValue(posts);
++        const {run, searchResults} = setup();
++
++        await run('ch1');
++
++        // Without collapsed threads the server returns replies as channel posts.
++        expect(getPosts).toHaveBeenCalledWith('ch1', 0, LATEST_POSTS_COUNT, false, false);
++        expect(searchResults()).toEqual({order: ['reply', 'root'], posts: posts.posts});
++    });
++
++    test('opens the panel for that channel before the messages arrive', async () => {
++        let resolve: (value: PostList) => void = () => {};
++        jest.spyOn(Client4, 'getPosts').mockReturnValue(new Promise((r) => {
++            resolve = r;
++        }));
++        const {current, run, types} = setup();
++
++        const done = run('ch1');
++        expect(current).toMatchObject({rhsState: RHSStates.CHANNEL_LATEST, selectedChannelId: 'ch1'});
++        expect(types()).toContain(SearchTypes.SEARCH_PINNED_POSTS_REQUEST);
++
++        resolve(posts);
++        await done;
++        expect(types()).toContain(SearchTypes.SEARCH_PINNED_POSTS_SUCCESS);
++    });
++
++    test('opening it again keeps the panel that was there before for the back button', async () => {
++        jest.spyOn(Client4, 'getPosts').mockResolvedValue(posts);
++        const {actions, run} = setup({rhsState: RHSStates.CHANNEL_LATEST, previousRhsStates: [RHSStates.CHANNEL_INFO], selectedChannelId: 'ch0'});
++
++        await run('ch1');
++
++        expect(actions.find((a) => a.type === ActionTypes.UPDATE_RHS_STATE)?.previousRhsState).toBe(RHSStates.CHANNEL_INFO);
++    });
++
++    test('messages that arrive after the panel switched to something else are dropped', async () => {
++        let resolve: (value: PostList) => void = () => {};
++        jest.spyOn(Client4, 'getPosts').mockReturnValue(new Promise((r) => {
++            resolve = r;
++        }));
++        const {current, run, searchResults, types} = setup();
++
++        const done = run('ch1');
++        current.rhsState = RHSStates.PIN;
++        resolve(posts);
++        await done;
++
++        expect(searchResults()).toBeUndefined();
++        expect(types()).toContain(SearchTypes.SEARCH_PINNED_POSTS_SUCCESS);
++    });
++
++    test('messages of the previous channel never replace the list of the new one', async () => {
++        let resolve: (value: PostList) => void = () => {};
++        jest.spyOn(Client4, 'getPosts').mockReturnValue(new Promise((r) => {
++            resolve = r;
++        }));
++        const {current, run, searchResults} = setup();
++
++        const done = run('ch1');
++        current.selectedChannelId = 'ch2';
++        resolve(posts);
++        await done;
++
++        expect(searchResults()).toBeUndefined();
++    });
++
++    test('a failed load stops the spinner', async () => {
++        jest.spyOn(Client4, 'getPosts').mockRejectedValue(new Error('offline'));
++        const {run, types} = setup();
++
++        const result = await run('ch1');
++
++        expect(result).toHaveProperty('error');
++        expect(types()).toContain(SearchTypes.SEARCH_PINNED_POSTS_FAILURE);
++    });
++});
+diff --git a/webapp/channels/src/actions/views/channel_latest.ts b/webapp/channels/src/actions/views/channel_latest.ts
+new file mode 100644
+index 00000000..0b53c974
+--- /dev/null
++++ b/webapp/channels/src/actions/views/channel_latest.ts
+@@ -0,0 +1,60 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import {batchActions} from 'redux-batched-actions';
++
++import {SearchTypes} from 'mattermost-redux/action_types';
++import {getMentionsAndStatusesForPosts, receivedPosts} from 'mattermost-redux/actions/posts';
++import {Client4} from 'mattermost-redux/client';
++import {getCurrentTeamId} from 'mattermost-redux/selectors/entities/teams';
++
++import {getPreviousRhsState, getRhsState, getSelectedChannelId} from 'selectors/rhs';
++
++import {ActionTypes, RHSStates} from 'utils/constants';
++
++import type {ActionFuncAsync} from 'types/store';
++
++export const LATEST_POSTS_COUNT = 60;
++
++// Shows the channel's latest messages in the right panel: root posts and replies to any thread,
++// followed or not, newest first. It reuses the pinned messages list, which already renders a flat
++// list of one channel's posts with jump and reply.
++export function showChannelLatest(channelId: string): ActionFuncAsync<boolean> {
++    return async (dispatch, getState) => {
++        const state = getState();
++        let previousRhsState = getRhsState(state);
++        if (previousRhsState === RHSStates.CHANNEL_LATEST) {
++            previousRhsState = getPreviousRhsState(state);
++        }
++        dispatch({type: ActionTypes.UPDATE_RHS_STATE, channelId, state: RHSStates.CHANNEL_LATEST, previousRhsState});
++
++        // The list shares the pinned posts' loading flag, so its spinner covers the previous results.
++        dispatch({type: SearchTypes.SEARCH_PINNED_POSTS_REQUEST});
++        let posts;
++        try {
++            posts = await Client4.getPosts(channelId, 0, LATEST_POSTS_COUNT, false, false);
++            await getMentionsAndStatusesForPosts(posts.posts, dispatch, getState);
++        } catch (error) {
++            dispatch({type: SearchTypes.SEARCH_PINNED_POSTS_FAILURE, error});
++            return {error};
++        }
++
++        // The panel may have moved on while the posts were loading: stop the spinner. If it moved to
++        // another channel, that channel's own load is running and will finish it.
++        if (getRhsState(getState()) !== RHSStates.CHANNEL_LATEST) {
++            dispatch({type: SearchTypes.SEARCH_PINNED_POSTS_SUCCESS});
++            return {data: false};
++        }
++        if (getSelectedChannelId(getState()) !== channelId) {
++            return {data: false};
++        }
++
++        dispatch(batchActions([
++            receivedPosts(posts),
++            {type: SearchTypes.RECEIVED_SEARCH_POSTS, data: {order: posts.order, posts: posts.posts}},
++            {type: SearchTypes.RECEIVED_SEARCH_TERM, data: {teamId: getCurrentTeamId(state), terms: null, isOrSearch: false}},
++            {type: SearchTypes.SEARCH_PINNED_POSTS_SUCCESS},
++        ]));
++        return {data: true};
++    };
++}
+diff --git a/webapp/channels/src/actions/views/rhs.ts b/webapp/channels/src/actions/views/rhs.ts
+index d5455637..845fa8f8 100644
+--- a/webapp/channels/src/actions/views/rhs.ts
++++ b/webapp/channels/src/actions/views/rhs.ts
+@@ -78,6 +78,7 @@ export function updateRhsState(rhsState: string, channelId?: string, previousRhs
+ 
+         if ([
+             RHSStates.PIN,
++            RHSStates.CHANNEL_LATEST,
+             RHSStates.CHANNEL_FILES,
+             RHSStates.CHANNEL_INFO,
+             RHSStates.CHANNEL_MEMBERS,
+diff --git a/webapp/channels/src/components/channel_header/channel_header.test.tsx b/webapp/channels/src/components/channel_header/channel_header.test.tsx
+index d3a6359e..33c77ba7 100644
+--- a/webapp/channels/src/components/channel_header/channel_header.test.tsx
++++ b/webapp/channels/src/components/channel_header/channel_header.test.tsx
+@@ -21,6 +21,7 @@ describe('components/ChannelHeader', () => {
+         actions: {
+             showPinnedPosts: jest.fn(),
+             showChannelFiles: jest.fn(),
++            showChannelLatest: jest.fn(),
+             closeRightHandSide: jest.fn(),
+             getCustomEmojisInText: jest.fn(),
+             updateChannelNotifyProps: jest.fn(),
+@@ -214,6 +215,32 @@ describe('components/ChannelHeader', () => {
+         expect(wrapper).toMatchSnapshot();
+     });
+ 
++    const latestButton = (wrapper: ReturnType<typeof shallowWithIntl>) => wrapper.find({buttonId: 'channelHeaderLatestButton'});
++
++    test('the latest messages button opens the list for this channel', () => {
++        const props = {...populatedProps, actions: {...populatedProps.actions, showChannelLatest: jest.fn(), closeRightHandSide: jest.fn()}};
++
++        const wrapper = shallowWithIntl(<ChannelHeader {...props}/>);
++        const button = latestButton(wrapper);
++        button.prop<() => void>('onClick')();
++
++        expect(props.actions.showChannelLatest).toHaveBeenCalledWith('channel_id');
++        expect(props.actions.closeRightHandSide).not.toHaveBeenCalled();
++        expect(button.prop('buttonClass')).not.toContain('channel-header__icon--active');
++    });
++
++    test('the latest messages button is active while the list is open, and closes it', () => {
++        const props = {...populatedProps, rhsState: RHSStates.CHANNEL_LATEST, actions: {...populatedProps.actions, showChannelLatest: jest.fn(), closeRightHandSide: jest.fn()}};
++
++        const wrapper = shallowWithIntl(<ChannelHeader {...props}/>);
++        const button = latestButton(wrapper);
++        expect(button.prop('buttonClass')).toContain('channel-header__icon--active');
++        button.prop<() => void>('onClick')();
++
++        expect(props.actions.closeRightHandSide).toHaveBeenCalled();
++        expect(props.actions.showChannelLatest).not.toHaveBeenCalled();
++    });
++
+     test('should render active flagged posts', () => {
+         const props = {
+             ...populatedProps,
+diff --git a/webapp/channels/src/components/channel_header/channel_header.tsx b/webapp/channels/src/components/channel_header/channel_header.tsx
+index 74718576..da9c22b6 100644
+--- a/webapp/channels/src/components/channel_header/channel_header.tsx
++++ b/webapp/channels/src/components/channel_header/channel_header.tsx
+@@ -87,6 +87,14 @@ class ChannelHeader extends React.PureComponent<Props> {
+         }
+     };
+ 
++    showChannelLatest = () => {
++        if (this.props.rhsState === RHSStates.CHANNEL_LATEST) {
++            this.props.actions.closeRightHandSide();
++        } else if (this.props.channel) {
++            this.props.actions.showChannelLatest(this.props.channel.id);
++        }
++    };
++
+     showChannelFiles = () => {
+         if (this.props.rhsState === RHSStates.CHANNEL_FILES) {
+             this.props.actions.closeRightHandSide();
+@@ -362,6 +370,19 @@ class ChannelHeader extends React.PureComponent<Props> {
+                                     {muteTrigger}
+                                     {memberListButton}
+                                     {pinnedButton}
++                                    <HeaderIconWrapper
++                                        buttonClass={classNames('channel-header__icon channel-header__icon--left btn btn-icon btn-xs', {
++                                            'channel-header__icon--active': rhsState === RHSStates.CHANNEL_LATEST,
++                                        })}
++                                        buttonId={'channelHeaderLatestButton'}
++                                        onClick={this.showChannelLatest}
++                                        tooltip={this.props.intl.formatMessage({id: 'channel_header.channelLatest', defaultMessage: 'Latest messages'})}
++                                    >
++                                        <i
++                                            aria-hidden='true'
++                                            className='icon icon-clock-outline'
++                                        />
++                                    </HeaderIconWrapper>
+                                     {this.props.isFileAttachmentsEnabled &&
+                                         <HeaderIconWrapper
+                                             buttonClass={channelFilesIconClass}
+diff --git a/webapp/channels/src/components/channel_header/index.ts b/webapp/channels/src/components/channel_header/index.ts
+index 94eb77eb..35ff040a 100644
+--- a/webapp/channels/src/components/channel_header/index.ts
++++ b/webapp/channels/src/components/channel_header/index.ts
+@@ -32,6 +32,7 @@ import {
+ } from 'mattermost-redux/selectors/entities/users';
+ import {getUserIdFromChannelName} from 'mattermost-redux/utils/channel_utils';
+ 
++import {showChannelLatest} from 'actions/views/channel_latest';
+ import {
+     showPinnedPosts,
+     showChannelFiles,
+@@ -115,6 +116,7 @@ const mapDispatchToProps = (dispatch: Dispatch) => ({
+     actions: bindActionCreators({
+         showPinnedPosts,
+         showChannelFiles,
++        showChannelLatest,
+         closeRightHandSide,
+         getCustomEmojisInText,
+         updateChannelNotifyProps,
+diff --git a/webapp/channels/src/components/post/index.tsx b/webapp/channels/src/components/post/index.tsx
+index c0c42cdd..10e040b8 100644
+--- a/webapp/channels/src/components/post/index.tsx
++++ b/webapp/channels/src/components/post/index.tsx
+@@ -140,6 +140,7 @@ function makeMapStateToProps() {
+         const rhsState = getRhsState(state);
+         if (
+             rhsState !== RHSStates.PIN && // Not show in pinned posts since they are all for the same channel
++            rhsState !== RHSStates.CHANNEL_LATEST &&
+             !isDMorGM && // Not show for DM or GMs since they don't belong to a team
+             memberships && Object.values(memberships).length > 1 // Not show if the user only belongs to one team
+         ) {
+diff --git a/webapp/channels/src/components/rhs_header_post/rhs_header_post.tsx b/webapp/channels/src/components/rhs_header_post/rhs_header_post.tsx
+index ce44134e..ce65b255 100644
+--- a/webapp/channels/src/components/rhs_header_post/rhs_header_post.tsx
++++ b/webapp/channels/src/components/rhs_header_post/rhs_header_post.tsx
+@@ -51,6 +51,7 @@ class RhsHeaderPost extends React.PureComponent<Props> {
+         case RHSStates.MENTION:
+         case RHSStates.FLAG:
+         case RHSStates.PIN:
++        case RHSStates.CHANNEL_LATEST:
+             this.props.goBack();
+             break;
+         default:
+@@ -104,6 +105,14 @@ class RhsHeaderPost extends React.PureComponent<Props> {
+                 />
+             );
+             break;
++        case RHSStates.CHANNEL_LATEST:
++            backToResultsTooltip = (
++                <FormattedMessage
++                    id='rhs_header.backToChannelLatestTooltip'
++                    defaultMessage='Back to latest messages'
++                />
++            );
++            break;
+         case RHSStates.PIN:
+             backToResultsTooltip = (
+                 <FormattedMessage
+diff --git a/webapp/channels/src/components/search/index.tsx b/webapp/channels/src/components/search/index.tsx
+index 7c6942e6..582a8aae 100644
+--- a/webapp/channels/src/components/search/index.tsx
++++ b/webapp/channels/src/components/search/index.tsx
+@@ -59,7 +59,7 @@ function mapStateToProps(state: GlobalState) {
+         hideMobileSearchBarInRHS: isMobileView && isRhsOpen && rhsState === RHSStates.CHANNEL_INFO,
+         isMentionSearch: rhsState === RHSStates.MENTION,
+         isFlaggedPosts: rhsState === RHSStates.FLAG,
+-        isPinnedPosts: rhsState === RHSStates.PIN,
++        isPinnedPosts: rhsState === RHSStates.PIN || rhsState === RHSStates.CHANNEL_LATEST, // both list one channel's posts
+         isChannelFiles: rhsState === RHSStates.CHANNEL_FILES,
+         isMobileView,
+         crossTeamSearchEnabled,
+diff --git a/webapp/channels/src/components/search_results/search_results.tsx b/webapp/channels/src/components/search_results/search_results.tsx
+index d5deedbd..dc189247 100644
+--- a/webapp/channels/src/components/search_results/search_results.tsx
++++ b/webapp/channels/src/components/search_results/search_results.tsx
+@@ -14,6 +14,7 @@ import {debounce} from 'mattermost-redux/actions/helpers';
+ import {getConfig} from 'mattermost-redux/selectors/entities/general';
+ 
+ import {getFilesDropdownPluginMenuItems} from 'selectors/plugins';
++import {getRhsState} from 'selectors/rhs';
+ 
+ import FileSearchResultItem from 'components/file_search_results';
+ import NoResultsIndicator from 'components/no_results_indicator/no_results_indicator';
+@@ -22,7 +23,7 @@ import SearchHint from 'components/search_hint/search_hint';
+ import SearchResultsHeader from 'components/search_results_header';
+ import LoadingWrapper from 'components/widgets/loading/loading_wrapper';
+ 
+-import {searchHintOptions, DataSearchTypes} from 'utils/constants';
++import {searchHintOptions, DataSearchTypes, RHSStates} from 'utils/constants';
+ import {isFileAttachmentsEnabled} from 'utils/file_utils';
+ 
+ import FilesFilterMenu from './files_filter_menu';
+@@ -173,6 +174,7 @@ const SearchResults: React.FC<Props> = (props: Props): JSX.Element => {
+ 
+     const noResults = (!results || !Array.isArray(results) || results.length === 0);
+     const noFileResults = (!fileResults || !Array.isArray(fileResults) || fileResults.length === 0);
++    const isChannelLatest = useSelector(getRhsState) === RHSStates.CHANNEL_LATEST;
+     const isLoading = isSearchingTerm || isSearchingFlaggedPost || isSearchingPinnedPost || !isOpened;
+     const isAtEnd = (searchType === DataSearchTypes.MESSAGES_SEARCH_TYPE && isSearchAtEnd) || (searchType === DataSearchTypes.FILES_SEARCH_TYPE && isSearchFilesAtEnd);
+     const showLoadMore = !isAtEnd && !isChannelFiles && !isFlaggedPosts && !isPinnedPosts;
+@@ -206,6 +208,14 @@ const SearchResults: React.FC<Props> = (props: Props): JSX.Element => {
+             id: 'search_header.title3',
+             defaultMessage: 'Saved messages',
+         });
++    } else if (isChannelLatest) {
++        noResultsProps.variant = NoResultsVariant.ChannelSearch;
++        noResultsProps.titleValues = {channelName: props.channelDisplayName ?? ''};
++        sortedResults = [...results];
++        titleDescriptor = defineMessage({
++            id: 'channel_header.channelLatest',
++            defaultMessage: 'Latest messages',
++        });
+     } else if (isPinnedPosts) {
+         noResultsProps.variant = NoResultsVariant.PinnedPosts;
+         noResultsProps.subtitleValues = {text: <strong>{
+diff --git a/webapp/channels/src/i18n/en.json b/webapp/channels/src/i18n/en.json
+index 487fd0d5..c5877494 100644
+--- a/webapp/channels/src/i18n/en.json
++++ b/webapp/channels/src/i18n/en.json
+@@ -3479,6 +3479,7 @@
+   "channel_bookmarks.editBookmarkLabel": "Bookmark menu",
+   "channel_bookmarks.open": "Open",
+   "channel_groups": "{channel} Groups",
++  "channel_header.channelLatest": "Latest messages",
+   "channel_header.channel_settings": "Channel Settings",
+   "channel_header.channelFiles": "Channel files",
+   "channel_header.channelHasGuests": "Channel has guests",
+@@ -5126,6 +5127,7 @@
+   "rhs_card.jump": "Jump",
+   "rhs_card.message_by": "Message by {avatar} {user}",
+   "rhs_header.back.icon": "Back Icon",
++  "rhs_header.backToChannelLatestTooltip": "Back to latest messages",
+   "rhs_header.backToFlaggedTooltip": "Back to saved messages",
+   "rhs_header.backToPinnedTooltip": "Back to pinned messages",
+   "rhs_header.backToResultsTooltip": "Back to search results",
+diff --git a/webapp/channels/src/i18n/ru.json b/webapp/channels/src/i18n/ru.json
+index 60ac5f22..84a5aacc 100644
+--- a/webapp/channels/src/i18n/ru.json
++++ b/webapp/channels/src/i18n/ru.json
+@@ -3157,6 +3157,7 @@
+   "channel_groups": "{channel} Группы",
+   "channel_header.channelFiles": "Файлы канала",
+   "channel_header.channelHasGuests": "На канале есть гости",
++  "channel_header.channelLatest": "Последние сообщения",
+   "channel_header.channelMembers": "Участники",
+   "channel_header.closeChannelInfo": "Закрыть информацию",
+   "channel_header.delete": "Архивировать канал",
+@@ -4623,6 +4624,7 @@
+   "rhs_card.jump": "Перейти",
+   "rhs_card.message_by": "Сообщение от {avatar} {user}",
+   "rhs_header.back.icon": "Значок назад",
++  "rhs_header.backToChannelLatestTooltip": "Назад к последним сообщениям",
+   "rhs_header.backToFlaggedTooltip": "Вернуться к сохраненным сообщениям",
+   "rhs_header.backToPinnedTooltip": "Вернуться к прикреплённым сообщениям",
+   "rhs_header.backToResultsTooltip": "Вернуться к результатам поиска",
+diff --git a/webapp/channels/src/reducers/views/rhs.ts b/webapp/channels/src/reducers/views/rhs.ts
+index 14c98667..c8b03c67 100644
+--- a/webapp/channels/src/reducers/views/rhs.ts
++++ b/webapp/channels/src/reducers/views/rhs.ts
+@@ -112,6 +112,7 @@ function selectedChannelId(state = '', action: MMAction) {
+     case ActionTypes.UPDATE_RHS_STATE:
+         if ([
+             RHSStates.PIN,
++            RHSStates.CHANNEL_LATEST,
+             RHSStates.CHANNEL_FILES,
+             RHSStates.CHANNEL_INFO,
+             RHSStates.CHANNEL_MEMBERS,
+diff --git a/webapp/channels/src/utils/constants.tsx b/webapp/channels/src/utils/constants.tsx
+index 75f78385..5b93b1e0 100644
+--- a/webapp/channels/src/utils/constants.tsx
++++ b/webapp/channels/src/utils/constants.tsx
+@@ -1081,6 +1081,9 @@ export const RHSStates = {
+     CHANNEL_INFO: 'channel-info',
+     CHANNEL_MEMBERS: 'channel-members',
+     EDIT_HISTORY: 'edit-history',
++
++    // The channel's latest messages, replies included, in one list by time.
++    CHANNEL_LATEST: 'channel-latest',
+ };
+ 
+ export const UploadStatuses = {

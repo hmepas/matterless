@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 3 Nov 2026 11:12:20 +0300
+Subject: [PATCH 02/11] Let the dev server front a remote Mattermost server
+
+Proxies to a remote https server, rewrites SiteURL so the desktop app keeps
+localhost, injects session cookies from env, stores the ALL layout in a file,
+and only answers to its own localhost Host header.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ webapp/channels/webpack.config.js | 187 +++++++++++++++++++++++++++++-
+ 1 file changed, 185 insertions(+), 2 deletions(-)
+
+diff --git a/webapp/channels/webpack.config.js b/webapp/channels/webpack.config.js
+index f58ac0a4..c7118189 100644
+--- a/webapp/channels/webpack.config.js
++++ b/webapp/channels/webpack.config.js
+@@ -3,12 +3,14 @@
+ 
+ /* eslint-disable no-console, no-process-env */
+ 
++const fs = require('fs');
+ const path = require('path');
+ const url = require('url');
+ 
+ const CopyWebpackPlugin = require('copy-webpack-plugin');
+ const ExternalTemplateRemotesPlugin = require('external-remotes-plugin');
+ const HtmlWebpackPlugin = require('html-webpack-plugin');
++const {responseInterceptor} = require('http-proxy-middleware'); // PATCH(all-teams)
+ const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+ const MonacoWebpackPlugin = require('monaco-editor-webpack-plugin');
+ const webpack = require('webpack');
+@@ -422,18 +424,67 @@ config.plugins.push(new webpack.DefinePlugin({
+ }));
+ 
+ if (targetIsDevServer) {
++    const proxyTarget = (process.env.MM_SERVICESETTINGS_SITEURL ?? 'http://localhost:8065').replace(/\/$/, '');
++    const devServerPort = Number(process.env.MM_DEV_PORT) || 9005;
++    const devServerOrigin = `http://localhost:${devServerPort}`;
++
++    // PATCH(all-teams): allow proxying to a remote (https) server: send its Host and make the
++    // Origin header match it, otherwise the websocket upgrade fails the same-origin check.
++    // (webpack-dev-server 5 bundles http-proxy-middleware v2, hence the onProxyReq* names.)
++    const rewriteOrigin = (proxyReq) => {
++        if (proxyReq.getHeader('origin')) {
++            proxyReq.setHeader('origin', proxyTarget);
++        }
++    };
+     const proxyToServer = {
+         logLevel: 'silent',
+-        target: process.env.MM_SERVICESETTINGS_SITEURL ?? 'http://localhost:8065',
++        target: proxyTarget,
+         xfwd: true,
++        changeOrigin: true,
++
++        // Drop the Domain attribute from Set-Cookie so session cookies stick to localhost.
++        cookieDomainRewrite: '',
++        onProxyReq: rewriteOrigin,
++        onProxyReqWs: rewriteOrigin,
+     };
+ 
++    // The desktop app replaces the server URL with the SiteURL it reads from the client config,
++    // which would send it back to the real server. Report this dev server as the SiteURL instead.
++    const rewriteSiteURL = responseInterceptor(async (buffer, proxyRes) => {
++        if (proxyRes.statusCode !== 200) {
++            return buffer;
++        }
++        try {
++            const clientConfig = JSON.parse(buffer.toString('utf8'));
++            clientConfig.SiteURL = devServerOrigin;
++            return JSON.stringify(clientConfig);
++        } catch {
++            return buffer;
++        }
++    });
++
+     config = {
+         ...config,
+         devtool: 'eval-cheap-module-source-map',
+         devServer: {
++            host: 'localhost', // PATCH(all-teams): never expose the proxy to the network.
++
++            // Upstream has dozens of harmless warnings (sass deprecations, mui); don't cover the app with them.
++            client: {
++                overlay: {
++                    warnings: false,
++                    errors: true,
++                    runtimeErrors: false,
++                },
++            },
+             liveReload: true,
+             proxy: [
++                {
++                    context: '/api/v4/config/client',
++                    ...proxyToServer,
++                    selfHandleResponse: true,
++                    onProxyRes: rewriteSiteURL,
++                },
+                 {
+                     context: '/api',
+                     ...proxyToServer,
+@@ -447,8 +498,140 @@ if (targetIsDevServer) {
+                     context: '/static/plugins',
+                     ...proxyToServer,
+                 },
++                {
++                    context: '/oauth', // PATCH(all-teams): server-side OAuth/SSO entry points.
++                    ...proxyToServer,
++                },
+             ],
+-            port: 9005,
++            port: devServerPort,
++
++            // PATCH(all-teams): reuse an existing session from the real server. Put its cookie values
++            // (DevTools > Application > Cookies on the real server) into MM_SESSION_TOKEN / MM_SESSION_USERID /
++            // MM_SESSION_CSRF and every page load from this dev server sets them for localhost. A /__auth
++            // form does the same by hand. Values only travel over loopback.
++            setupMiddlewares: (middlewares, devServer) => {
++                // A site whose hostname is rebound to 127.0.0.1 would otherwise get the injected session
++                // cookies and the proxy to the real server. Registered first, so it covers every route.
++                const allowedHost = `localhost:${devServerPort}`;
++                devServer.app.use((req, res, next) => {
++                    if (req.headers.host === allowedHost) {
++                        next();
++                    } else {
++                        res.status(403).end();
++                    }
++                });
++
++                const cookieNames = ['MMAUTHTOKEN', 'MMUSERID', 'MMCSRF'];
++                const maxAge = 30 * 24 * 60 * 60;
++                const buildCookies = (values) => cookieNames.map((name) => (
++                    `${name}=${encodeURIComponent(values[name].trim())}; Path=/; Max-Age=${maxAge}; SameSite=Lax${name === 'MMAUTHTOKEN' ? '; HttpOnly' : ''}`
++                ));
++                const tokenFromCookieHeader = (header) => {
++                    const match = (/(?:^|;\s*)MMAUTHTOKEN=([^;]*)/).exec(header || '');
++                    return match ? decodeURIComponent(match[1]) : '';
++                };
++
++                const sessionFromEnv = {
++                    MMAUTHTOKEN: process.env.MM_SESSION_TOKEN,
++                    MMUSERID: process.env.MM_SESSION_USERID,
++                    MMCSRF: process.env.MM_SESSION_CSRF,
++                };
++                if (cookieNames.every((name) => sessionFromEnv[name])) {
++                    middlewares.unshift({
++                        name: 'inject-session-cookies',
++                        middleware: (req, res, next) => {
++                            const isPageLoad = req.method === 'GET' && (req.headers.accept || '').includes('text/html');
++                            if (isPageLoad && tokenFromCookieHeader(req.headers.cookie) !== sessionFromEnv.MMAUTHTOKEN.trim()) {
++                                res.setHeader('Set-Cookie', buildCookies(sessionFromEnv));
++                            }
++                            next();
++                        },
++                    });
++                }
++
++                // PATCH(all-teams): the ALL pseudo-team's categories and channel order, kept in a local
++                // file so they survive a wiped browser profile. Only same-origin JSON writes pass.
++                const layoutFile = process.env.MM_ALL_TEAMS_LAYOUT_FILE;
++                if (layoutFile) {
++                    const isValidLayout = (layout) => Array.isArray(layout?.groups) && layout.groups.some((group) => group.id === 'default');
++
++                    devServer.app.get('/__all_teams_layout', (req, res) => {
++                        fs.readFile(layoutFile, 'utf8', (error, content) => {
++                            if (error) {
++                                res.status(error.code === 'ENOENT' ? 204 : 500).end();
++                                return;
++                            }
++                            res.type('json').send(content);
++                        });
++                    });
++                    devServer.app.put('/__all_teams_layout', (req, res) => {
++                        if ((req.headers.origin && req.headers.origin !== devServerOrigin) || !req.is('application/json')) {
++                            res.status(403).end();
++                            return;
++                        }
++
++                        let body = '';
++                        req.on('data', (chunk) => {
++                            body += chunk;
++                        });
++                        req.on('end', () => {
++                            let layout;
++                            try {
++                                layout = JSON.parse(body);
++                            } catch {
++                                layout = null;
++                            }
++                            if (!isValidLayout(layout)) {
++                                res.status(400).end();
++                                return;
++                            }
++
++                            // Written to the side and renamed, so a crash can't leave half a file.
++                            const tmpFile = `${layoutFile}.tmp`;
++                            fs.writeFile(tmpFile, JSON.stringify(layout, null, 2), (writeError) => {
++                                if (writeError) {
++                                    res.status(500).end();
++                                    return;
++                                }
++                                fs.rename(tmpFile, layoutFile, (renameError) => {
++                                    res.status(renameError ? 500 : 204).end();
++                                });
++                            });
++                        });
++                    });
++                }
++
++                const authForm = `<!doctype html><title>Clone session</title>
++<body style="font:14px sans-serif;max-width:40em;margin:3em auto">
++<h3>Clone session from ${proxyTarget}</h3>
++<p>Real server tab &rarr; DevTools &rarr; Application &rarr; Cookies &rarr; copy values.</p>
++<form method="post" action="/__auth">
++<label>MMAUTHTOKEN<br><input name="MMAUTHTOKEN" style="width:100%" autocomplete="off"></label><br><br>
++<label>MMUSERID<br><input name="MMUSERID" style="width:100%" autocomplete="off"></label><br><br>
++<label>MMCSRF<br><input name="MMCSRF" style="width:100%" autocomplete="off"></label><br><br>
++<button>Set cookies and open app</button>
++</form>`;
++                devServer.app.get('/__auth', (req, res) => {
++                    res.type('html').send(authForm);
++                });
++                devServer.app.post('/__auth', (req, res) => {
++                    let body = '';
++                    req.on('data', (chunk) => {
++                        body += chunk;
++                    });
++                    req.on('end', () => {
++                        const fields = new URLSearchParams(body);
++                        const values = Object.fromEntries(cookieNames.map((name) => [name, fields.get(name) || '']));
++                        if (!cookieNames.every((name) => values[name])) {
++                            res.status(400).type('text').send('all three cookies are required');
++                            return;
++                        }
++                        res.setHeader('Set-Cookie', buildCookies(values));
++                        res.redirect('/');
++                    });
++                });
++                return middlewares;
++            },
+             devMiddleware: {
+                 writeToDisk: false,
+             },

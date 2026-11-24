@@ -1,0 +1,585 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Fri, 6 Nov 2026 12:56:55 +0300
+Subject: [PATCH 07/11] Share links with the real server's address behind the
+ local proxy
+
+The proxy reports itself as SiteURL so the desktop app stays on localhost, which made copied and
+forwarded links point at localhost. Links that leave the webapp now use ProxyUpstreamSiteURL from
+the client config, and links to the real server in messages and bookmarks open in this webapp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ webapp/channels/src/actions/views/posts.js    |   4 +-
+ .../channel_bookmarks/bookmark_dot_menu.tsx   |   5 +-
+ .../channel_bookmarks/bookmark_item.tsx       |   3 +-
+ .../channel_info_rhs/channel_info_rhs.tsx     |   4 +-
+ .../channel_name_form_field.tsx               |   5 +-
+ .../components/team_url/team_url.tsx          |   3 +-
+ .../channels/src/components/dot_menu/index.ts |   4 +-
+ .../file_search_result_item.tsx               |   4 +-
+ .../components/forward_post_modal/index.tsx   |   4 +-
+ .../confirm_integration.tsx                   |   4 +-
+ .../installed_incoming_webhook.tsx            |   4 +-
+ .../invitation_modal/invite_view.tsx          |   4 +-
+ .../sidebar_channel_menu/index.ts             |   4 +-
+ .../thread_menu/thread_menu.tsx               |   4 +-
+ .../channels/src/utils/markdown/renderer.tsx  |   4 +
+ .../src/utils/public_site_url.test.ts         | 167 ++++++++++++++++++
+ webapp/channels/src/utils/public_site_url.ts  |  35 ++++
+ 17 files changed, 236 insertions(+), 26 deletions(-)
+ create mode 100644 webapp/channels/src/utils/public_site_url.test.ts
+ create mode 100644 webapp/channels/src/utils/public_site_url.ts
+
+diff --git a/webapp/channels/src/actions/views/posts.js b/webapp/channels/src/actions/views/posts.js
+index ddf52eec..041b6fac 100644
+--- a/webapp/channels/src/actions/views/posts.js
++++ b/webapp/channels/src/actions/views/posts.js
+@@ -15,7 +15,7 @@ import {getPermalinkURL} from 'selectors/urls';
+ 
+ import {ActionTypes, AnnouncementBarTypes} from 'utils/constants';
+ import {containsAtChannel, groupsMentionedInText} from 'utils/post_utils';
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ import {getTimestamp} from 'utils/utils';
+ 
+ import {runMessageWillBePostedHooks} from '../hooks';
+@@ -42,7 +42,7 @@ export function forwardPost(post, channel, message = '') {
+         const currentTeam = getCurrentTeam(state);
+ 
+         const relativePermaLink = getPermalinkURL(state, currentTeam.id, post.id);
+-        const permaLink = `${getSiteURL()}${relativePermaLink}`;
++        const permaLink = `${getPublicSiteURL()}${relativePermaLink}`;
+ 
+         const license = getLicense(state);
+         const isLDAPEnabled = license?.IsLicensed === 'true' && license?.LDAPGroups === 'true';
+diff --git a/webapp/channels/src/components/channel_bookmarks/bookmark_dot_menu.tsx b/webapp/channels/src/components/channel_bookmarks/bookmark_dot_menu.tsx
+index 382bd991..288aad85 100644
+--- a/webapp/channels/src/components/channel_bookmarks/bookmark_dot_menu.tsx
++++ b/webapp/channels/src/components/channel_bookmarks/bookmark_dot_menu.tsx
+@@ -26,6 +26,7 @@ import GetPublicModal from 'components/get_public_link_modal';
+ import * as Menu from 'components/menu';
+ 
+ import {ModalIdentifiers} from 'utils/constants';
++import {toLocalURL, toPublicURL} from 'utils/public_site_url';
+ import {getSiteURL, shouldOpenInNewTab} from 'utils/url';
+ import {copyToClipboard} from 'utils/utils';
+ 
+@@ -42,7 +43,7 @@ const BookmarkItemDotMenu = ({
+     const dispatch = useDispatch();
+ 
+     const siteURL = getSiteURL();
+-    const openInNewTab = bookmark.type === 'link' && bookmark.link_url && shouldOpenInNewTab(bookmark.link_url, siteURL);
++    const openInNewTab = bookmark.type === 'link' && bookmark.link_url && shouldOpenInNewTab(toLocalURL(bookmark.link_url), siteURL);
+ 
+     let openIcon;
+     if (bookmark.type === 'file') {
+@@ -77,7 +78,7 @@ const BookmarkItemDotMenu = ({
+         if (bookmark.type === 'link' && bookmark.link_url) {
+             copyToClipboard(bookmark.link_url);
+         } else if (bookmark.type === 'file' && bookmark.file_id) {
+-            copyToClipboard(getFileDownloadUrl(bookmark.file_id));
++            copyToClipboard(toPublicURL(getFileDownloadUrl(bookmark.file_id)));
+         }
+     }, [bookmark.type, bookmark.link_url, bookmark.file_id]);
+ 
+diff --git a/webapp/channels/src/components/channel_bookmarks/bookmark_item.tsx b/webapp/channels/src/components/channel_bookmarks/bookmark_item.tsx
+index fc0ae5c0..d0711650 100644
+--- a/webapp/channels/src/components/channel_bookmarks/bookmark_item.tsx
++++ b/webapp/channels/src/components/channel_bookmarks/bookmark_item.tsx
+@@ -21,6 +21,7 @@ import ExternalLink from 'components/external_link';
+ import FilePreviewModal from 'components/file_preview_modal';
+ 
+ import {ModalIdentifiers} from 'utils/constants';
++import {toLocalURL} from 'utils/public_site_url';
+ import {getSiteURL, shouldOpenInNewTab} from 'utils/url';
+ 
+ import type {GlobalState} from 'types/store';
+@@ -66,7 +67,7 @@ const useBookmarkLink = (bookmark: ChannelBookmark) => {
+     if (bookmark.type === 'link' && bookmark.link_url) {
+         link = (
+             <DynamicLink
+-                href={bookmark.link_url}
++                href={toLocalURL(bookmark.link_url)}
+                 ref={linkRef}
+                 isFile={false}
+             >
+diff --git a/webapp/channels/src/components/channel_info_rhs/channel_info_rhs.tsx b/webapp/channels/src/components/channel_info_rhs/channel_info_rhs.tsx
+index b8183692..a897b44d 100644
+--- a/webapp/channels/src/components/channel_info_rhs/channel_info_rhs.tsx
++++ b/webapp/channels/src/components/channel_info_rhs/channel_info_rhs.tsx
+@@ -15,7 +15,7 @@ import EditChannelPurposeModal from 'components/edit_channel_purpose_modal';
+ import MoreDirectChannels from 'components/more_direct_channels';
+ 
+ import Constants, {ModalIdentifiers} from 'utils/constants';
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ 
+ import type {ModalData} from 'types/actions';
+ 
+@@ -82,7 +82,7 @@ const ChannelInfoRhs = ({
+     actions,
+ }: Props) => {
+     const currentUserId = currentUser.id;
+-    const channelURL = getSiteURL() + '/' + currentTeam.name + '/channels/' + channel.name;
++    const channelURL = getPublicSiteURL() + '/' + currentTeam.name + '/channels/' + channel.name;
+ 
+     const toggleFavorite = () => {
+         if (isFavorite) {
+diff --git a/webapp/channels/src/components/channel_name_form_field/channel_name_form_field.tsx b/webapp/channels/src/components/channel_name_form_field/channel_name_form_field.tsx
+index 88aeff8c..a33ffd6f 100644
+--- a/webapp/channels/src/components/channel_name_form_field/channel_name_form_field.tsx
++++ b/webapp/channels/src/components/channel_name_form_field/channel_name_form_field.tsx
+@@ -15,7 +15,8 @@ import Input from 'components/widgets/inputs/input/input';
+ import URLInput from 'components/widgets/inputs/url_input/url_input';
+ 
+ import Constants from 'utils/constants';
+-import {cleanUpUrlable, getSiteURL, validateChannelUrl} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
++import {cleanUpUrlable, validateChannelUrl} from 'utils/url';
+ import {generateSlug} from 'utils/utils';
+ 
+ export type Props = {
+@@ -207,7 +208,7 @@ const ChannelNameFormField = (props: Props): JSX.Element => {
+             />
+             <URLInput
+                 className='new-channel-modal__url'
+-                base={getSiteURL()}
++                base={getPublicSiteURL()}
+                 path={`${teamName}/channels`}
+                 pathInfo={url}
+                 limit={Constants.MAX_CHANNELNAME_LENGTH}
+diff --git a/webapp/channels/src/components/create_team/components/team_url/team_url.tsx b/webapp/channels/src/components/create_team/components/team_url/team_url.tsx
+index 2ee2843a..f714c11e 100644
+--- a/webapp/channels/src/components/create_team/components/team_url/team_url.tsx
++++ b/webapp/channels/src/components/create_team/components/team_url/team_url.tsx
+@@ -16,6 +16,7 @@ import WithTooltip from 'components/with_tooltip';
+ 
+ import logoImage from 'images/logo.png';
+ import Constants from 'utils/constants';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ import * as URL from 'utils/url';
+ 
+ type State = {
+@@ -208,7 +209,7 @@ export default class TeamUrl extends React.PureComponent<Props, State> {
+             nameDivClass += ' has-error';
+         }
+ 
+-        const title = `${URL.getSiteURL()}/`;
++        const title = `${getPublicSiteURL()}/`;
+ 
+         let finishMessage = (
+             <FormattedMessage
+diff --git a/webapp/channels/src/components/dot_menu/index.ts b/webapp/channels/src/components/dot_menu/index.ts
+index 0497bce4..6b64aae6 100644
+--- a/webapp/channels/src/components/dot_menu/index.ts
++++ b/webapp/channels/src/components/dot_menu/index.ts
+@@ -35,8 +35,8 @@ import {isArchivedChannel} from 'utils/channel_utils';
+ import {Locations, Preferences} from 'utils/constants';
+ import * as PostUtils from 'utils/post_utils';
+ import {matchUserMentionTriggersWithMessageMentions} from 'utils/post_utils';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ import {allAtMentions} from 'utils/text_formatting';
+-import {getSiteURL} from 'utils/url';
+ 
+ import type {GlobalState} from 'types/store';
+ 
+@@ -60,7 +60,7 @@ function makeMapStateToProps() {
+         const channel = getChannel(state, post.channel_id);
+         const currentTeam = getCurrentTeam(state);
+         const team = channel ? getTeam(state, channel.team_id) : undefined;
+-        const teamUrl = `${getSiteURL()}/${team?.name || currentTeam?.name}`;
++        const teamUrl = `${getPublicSiteURL()}/${team?.name || currentTeam?.name}`;
+         const isMilitaryTime = getBool(state, Preferences.CATEGORY_DISPLAY_SETTINGS, Preferences.USE_MILITARY_TIME, false);
+ 
+         const systemMessage = isSystemMessage(post);
+diff --git a/webapp/channels/src/components/file_search_results/file_search_result_item.tsx b/webapp/channels/src/components/file_search_results/file_search_result_item.tsx
+index 7e79e2af..66a89690 100644
+--- a/webapp/channels/src/components/file_search_results/file_search_result_item.tsx
++++ b/webapp/channels/src/components/file_search_results/file_search_result_item.tsx
+@@ -16,7 +16,7 @@ import WithTooltip from 'components/with_tooltip';
+ 
+ import {getHistory} from 'utils/browser_history';
+ import Constants, {ModalIdentifiers} from 'utils/constants';
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ import {fileSizeToString, copyToClipboard, localizeMessage} from 'utils/utils';
+ 
+ import type {PropsFromRedux, OwnProps} from './index';
+@@ -46,7 +46,7 @@ export default class FileSearchResultItem extends React.PureComponent<Props, Sta
+     };
+ 
+     private copyLink = () => {
+-        copyToClipboard(`${getSiteURL()}/${this.props.teamName}/pl/${this.props.fileInfo.post_id}`);
++        copyToClipboard(`${getPublicSiteURL()}/${this.props.teamName}/pl/${this.props.fileInfo.post_id}`);
+     };
+ 
+     private stopPropagation = (e: React.MouseEvent<HTMLElement, MouseEvent>) => {
+diff --git a/webapp/channels/src/components/forward_post_modal/index.tsx b/webapp/channels/src/components/forward_post_modal/index.tsx
+index e81bc575..469f1deb 100644
+--- a/webapp/channels/src/components/forward_post_modal/index.tsx
++++ b/webapp/channels/src/components/forward_post_modal/index.tsx
+@@ -25,7 +25,7 @@ import NotificationBox from 'components/notification_box';
+ import PostMessagePreview from 'components/post_view/post_message_preview';
+ 
+ import Constants from 'utils/constants';
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ 
+ import type {GlobalState} from 'types/store';
+ 
+@@ -56,7 +56,7 @@ const ForwardPostModal = ({onExited, post}: Props) => {
+     const currentTeam = useSelector(getCurrentTeam);
+ 
+     const relativePermaLink = useSelector((state: GlobalState) => (currentTeam ? getPermalinkURL(state, currentTeam.id, post.id) : ''));
+-    const permaLink = `${getSiteURL()}${relativePermaLink}`;
++    const permaLink = `${getPublicSiteURL()}${relativePermaLink}`;
+ 
+     const isPrivateConversation = channel?.type !== Constants.OPEN_CHANNEL;
+ 
+diff --git a/webapp/channels/src/components/integrations/confirm_integration/confirm_integration.tsx b/webapp/channels/src/components/integrations/confirm_integration/confirm_integration.tsx
+index 11c46fd0..87c3a959 100644
+--- a/webapp/channels/src/components/integrations/confirm_integration/confirm_integration.tsx
++++ b/webapp/channels/src/components/integrations/confirm_integration/confirm_integration.tsx
+@@ -15,7 +15,7 @@ import CopyText from 'components/copy_text';
+ import ExternalLink from 'components/external_link';
+ 
+ import {Constants, DeveloperLinks, ErrorPageTypes} from 'utils/constants';
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ 
+ type Props = {
+     team: Team;
+@@ -103,7 +103,7 @@ const ConfirmIntegration = ({team, location, commands, oauthApps, incomingHooks,
+             </p>
+         );
+     } else if (type === Constants.Integrations.INCOMING_WEBHOOK && incomingHook) {
+-        const incomingHookToken = getSiteURL() + '/hooks/' + incomingHook.id;
++        const incomingHookToken = getPublicSiteURL() + '/hooks/' + incomingHook.id;
+ 
+         headerText = (
+             <FormattedMessage
+diff --git a/webapp/channels/src/components/integrations/installed_incoming_webhook.tsx b/webapp/channels/src/components/integrations/installed_incoming_webhook.tsx
+index d3e8a680..f6d739d1 100644
+--- a/webapp/channels/src/components/integrations/installed_incoming_webhook.tsx
++++ b/webapp/channels/src/components/integrations/installed_incoming_webhook.tsx
+@@ -11,7 +11,7 @@ import type {Team} from '@mattermost/types/teams';
+ 
+ import CopyText from 'components/copy_text';
+ 
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ 
+ import DeleteIntegrationLink from './delete_integration_link';
+ 
+@@ -137,7 +137,7 @@ export default class InstalledIncomingWebhook extends React.PureComponent<Props>
+             );
+         }
+ 
+-        const incomingWebhookId = getSiteURL() + '/hooks/' + incomingWebhook.id;
++        const incomingWebhookId = getPublicSiteURL() + '/hooks/' + incomingWebhook.id;
+ 
+         return (
+             <div className='backstage-list__item'>
+diff --git a/webapp/channels/src/components/invitation_modal/invite_view.tsx b/webapp/channels/src/components/invitation_modal/invite_view.tsx
+index 0c504636..f6dd01cf 100644
+--- a/webapp/channels/src/components/invitation_modal/invite_view.tsx
++++ b/webapp/channels/src/components/invitation_modal/invite_view.tsx
+@@ -20,7 +20,7 @@ import {getAnalyticsCategory} from 'components/onboarding_tasks';
+ import UsersEmailsInput from 'components/widgets/inputs/users_emails_input';
+ 
+ import {Constants} from 'utils/constants';
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ import {getTrackFlowRole, getRoleForTrackFlow, getSourceForTrackFlow} from 'utils/utils';
+ 
+ import AddToChannels, {defaultCustomMessage, defaultInviteChannels} from './add_to_channels';
+@@ -88,7 +88,7 @@ export default function InviteView(props: Props) {
+     const {formatMessage} = useIntl();
+ 
+     const inviteURL = useMemo(() => {
+-        return `${getSiteURL()}/signup_user_complete/?id=${props.currentTeam.invite_id}&md=link&sbr=${trackFlowRole}`;
++        return `${getPublicSiteURL()}/signup_user_complete/?id=${props.currentTeam.invite_id}&md=link&sbr=${trackFlowRole}`;
+     }, [props.currentTeam.invite_id, trackFlowRole]);
+ 
+     const copyText = useCopyText({
+diff --git a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel_menu/index.ts b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel_menu/index.ts
+index 1278fc65..7628d97c 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel_menu/index.ts
++++ b/webapp/channels/src/components/sidebar/sidebar_channel/sidebar_channel_menu/index.ts
+@@ -18,7 +18,7 @@ import {unmuteChannel, muteChannel} from 'actions/channel_actions';
+ import {markMostRecentPostInChannelAsUnread} from 'actions/post_actions';
+ import {openModal} from 'actions/views/modals';
+ 
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ 
+ import type {GlobalState} from 'types/store';
+ 
+@@ -48,7 +48,7 @@ function mapStateToProps(state: GlobalState, ownProps: OwnProps) {
+         currentUserId: getCurrentUserId(state),
+         isFavorite: isFavoriteChannel(state, ownProps.channel.id),
+         isMuted: isChannelMuted(member),
+-        channelLink: `${getSiteURL()}${ownProps.channelLink}`,
++        channelLink: `${getPublicSiteURL()}${ownProps.channelLink}`,
+         managePublicChannelMembers,
+         managePrivateChannelMembers,
+     };
+diff --git a/webapp/channels/src/components/threading/global_threads/thread_menu/thread_menu.tsx b/webapp/channels/src/components/threading/global_threads/thread_menu/thread_menu.tsx
+index 5663d488..1c53f2aa 100644
+--- a/webapp/channels/src/components/threading/global_threads/thread_menu/thread_menu.tsx
++++ b/webapp/channels/src/components/threading/global_threads/thread_menu/thread_menu.tsx
+@@ -20,7 +20,7 @@ import {manuallyMarkThreadAsUnread} from 'actions/views/threads';
+ import Menu from 'components/widgets/menu/menu';
+ import MenuWrapper from 'components/widgets/menu/menu_wrapper';
+ 
+-import {getSiteURL} from 'utils/url';
++import {getPublicSiteURL} from 'utils/public_site_url';
+ import {copyToClipboard} from 'utils/utils';
+ 
+ import type {GlobalState} from 'types/store';
+@@ -149,7 +149,7 @@ function ThreadMenu({
+                         defaultMessage: 'Copy link',
+                     })}
+                     onClick={useCallback(() => {
+-                        copyToClipboard(`${getSiteURL()}/${team}/pl/${threadId}`);
++                        copyToClipboard(`${getPublicSiteURL()}/${team}/pl/${threadId}`);
+                     }, [team, threadId])}
+                 />
+             </Menu>
+diff --git a/webapp/channels/src/utils/markdown/renderer.tsx b/webapp/channels/src/utils/markdown/renderer.tsx
+index fe7de720..3a96994b 100644
+--- a/webapp/channels/src/utils/markdown/renderer.tsx
++++ b/webapp/channels/src/utils/markdown/renderer.tsx
+@@ -5,6 +5,7 @@ import marked from 'marked';
+ import type {MarkedOptions} from 'marked';
+ 
+ import EmojiMap from 'utils/emoji_map';
++import {toLocalURL} from 'utils/public_site_url';
+ import * as PostUtils from 'utils/post_utils';
+ import * as TextFormatting from 'utils/text_formatting';
+ import {mightTriggerExternalRequest, getScheme, isUrlSafe, shouldOpenInNewTab} from 'utils/url';
+@@ -159,6 +160,9 @@ export default class Renderer extends marked.Renderer {
+             }
+         }
+ 
++        // A link to the real server behind the local proxy opens here, not in another app tab.
++        outHref = toLocalURL(outHref);
++
+         if (!isUrlSafe(unescapeHtmlEntities(href))) {
+             return text;
+         }
+diff --git a/webapp/channels/src/utils/public_site_url.test.ts b/webapp/channels/src/utils/public_site_url.test.ts
+new file mode 100644
+index 00000000..7fc3a06f
+--- /dev/null
++++ b/webapp/channels/src/utils/public_site_url.test.ts
+@@ -0,0 +1,167 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import fs from 'fs';
++import path from 'path';
++
++import type {ChannelBookmark} from '@mattermost/types/channel_bookmarks';
++import type {Channel} from '@mattermost/types/channels';
++import type {Post} from '@mattermost/types/posts';
++
++import * as PostActions from 'mattermost-redux/actions/posts';
++import {Client4} from 'mattermost-redux/client';
++
++import {forwardPost} from 'actions/views/posts';
++
++import {copyBookmarkLink, shouldOpenBookmarkInNewTab} from 'components/channel_bookmarks/utils';
++
++import {format} from 'utils/markdown';
++import {copyToClipboard} from 'utils/utils';
++
++import type {GlobalState} from 'types/store';
++
++import {getPublicSiteURL, toLocalURL, toPublicURL} from './public_site_url';
++
++// jsdom serves the tests from the address of the local proxy.
++const PROXY = 'http://localhost:8065';
++const REAL = 'https://chat.example';
++
++let config: Record<string, string> = {};
++const state = () => ({
++    entities: {
++        general: {config, license: {}},
++        users: {currentUserId: 'me', profiles: {}},
++        teams: {currentTeamId: 't1', teams: {t1: {id: 't1', name: 'acme'}}, myMembers: {}},
++        channels: {channels: {}, myMembers: {}, roles: {}},
++        roles: {roles: {}},
++        preferences: {myPreferences: {}},
++        groups: {groups: {}, syncables: {}, myGroups: []},
++    },
++    plugins: {components: {}},
++}) as unknown as GlobalState;
++
++jest.mock('stores/redux_store', () => ({getState: () => state(), dispatch: jest.fn(), subscribe: jest.fn()}));
++jest.mock('utils/utils', () => ({...jest.requireActual('utils/utils'), copyToClipboard: jest.fn()}));
++
++const behindProxy = () => {
++    config = {SiteURL: PROXY, ProxyUpstreamSiteURL: REAL};
++};
++
++describe('links behind the local proxy', () => {
++    beforeEach(() => {
++        config = {};
++        jest.clearAllMocks();
++    });
++
++    describe('site URL', () => {
++        test('without the proxy, the public site URL is the local one', () => {
++            expect(getPublicSiteURL()).toBe(PROXY);
++            expect(toPublicURL(`${PROXY}/acme/pl/abc`)).toBe(`${PROXY}/acme/pl/abc`);
++            expect(toLocalURL(`${REAL}/acme/pl/abc`)).toBe(`${REAL}/acme/pl/abc`);
++        });
++
++        test('behind the proxy, the public site URL is the real server', () => {
++            behindProxy();
++            expect(getPublicSiteURL()).toBe(REAL);
++        });
++
++        test('a trailing slash of the real server address is dropped', () => {
++            config = {ProxyUpstreamSiteURL: `${REAL}/`};
++            expect(getPublicSiteURL()).toBe(REAL);
++        });
++    });
++
++    describe('outgoing links', () => {
++        beforeEach(behindProxy);
++
++        test('a proxy link is turned into a real server link', () => {
++            expect(toPublicURL(`${PROXY}/acme/pl/abc`)).toBe(`${REAL}/acme/pl/abc`);
++            expect(toPublicURL(PROXY)).toBe(REAL);
++            expect(toPublicURL(`${PROXY}?x=1`)).toBe(`${REAL}?x=1`);
++        });
++
++        test('foreign links and look-alike hosts are kept', () => {
++            expect(toPublicURL('https://example.org/acme/pl/abc')).toBe('https://example.org/acme/pl/abc');
++            expect(toPublicURL(`${PROXY}0/acme/pl/abc`)).toBe(`${PROXY}0/acme/pl/abc`);
++        });
++
++        test('forwarding a post sends a real server permalink', async () => {
++            const createPost = jest.spyOn(PostActions, 'createPost').mockReturnValue((() => ({data: true})) as never);
++            const post = {id: 'p1', channel_id: 'from'} as Post;
++            const channel = {id: 'to', team_id: 't1', type: 'O'} as Channel;
++            const dispatch: jest.Mock = jest.fn((action): unknown => (typeof action === 'function' ? action(dispatch, state) : action));
++
++            await forwardPost(post, channel, 'look')(dispatch, state, {} as never);
++
++            expect(createPost.mock.calls[0][0].message).toBe(`look\n${REAL}/acme/pl/p1`);
++        });
++
++        test('copying the link of a file bookmark copies a real server link', () => {
++            Client4.setUrl(PROXY); // as root.tsx does on start
++            copyBookmarkLink({type: 'file', file_id: 'f1'} as ChannelBookmark);
++            expect(copyToClipboard).toHaveBeenCalledWith(`${REAL}/api/v4/files/f1?download=1`);
++        });
++
++        test('copying the link of a link bookmark copies it as is', () => {
++            copyBookmarkLink({type: 'link', link_url: `${REAL}/acme/channels/town-square`} as ChannelBookmark);
++            expect(copyToClipboard).toHaveBeenCalledWith(`${REAL}/acme/channels/town-square`);
++        });
++
++        // These build a shared link from one getPublicSiteURL() call each: guard against a rebase
++        // onto upstream putting getSiteURL() back.
++        test.each([
++            ['copy link of a post', 'components/dot_menu/index.ts'],
++            ['copy link of a channel in the sidebar', 'components/sidebar/sidebar_channel/sidebar_channel_menu/index.ts'],
++            ['copy link of a channel in channel info', 'components/channel_info_rhs/channel_info_rhs.tsx'],
++            ['copy link of a thread', 'components/threading/global_threads/thread_menu/thread_menu.tsx'],
++            ['copy link of a file in search results', 'components/file_search_results/file_search_result_item.tsx'],
++            ['length of a forwarded message', 'components/forward_post_modal/index.tsx'],
++            ['forwarded post permalink', 'actions/views/posts.ts'],
++            ['team invite link', 'components/invitation_modal/invite_view.tsx'],
++            ['incoming webhook URL in the list', 'components/integrations/installed_incoming_webhook.tsx'],
++            ['incoming webhook URL after creation', 'components/integrations/confirm_integration/confirm_integration.tsx'],
++            ['channel URL shown when creating a channel', 'components/channel_name_form_field/channel_name_form_field.tsx'],
++            ['team URL shown when creating a team', 'components/create_team/components/create_team_form/team_url_step.tsx'],
++        ])('%s uses the real server address', (_, file) => {
++            const source = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
++            expect(source).toContain('getPublicSiteURL()');
++            expect(source).not.toContain('getSiteURL()');
++        });
++    });
++
++    describe('incoming links', () => {
++        beforeEach(behindProxy);
++
++        test('a real server link is turned into a proxy link', () => {
++            expect(toLocalURL(`${REAL}/acme/pl/abc`)).toBe(`${PROXY}/acme/pl/abc`);
++        });
++
++        test('a real server link in a message opens inside this app', () => {
++            const html = format(`see ${REAL}/acme/pl/abc`, {siteURL: PROXY});
++            expect(html).toContain(`href="${PROXY}/acme/pl/abc"`);
++            expect(html).toContain('data-link="/acme/pl/abc"');
++            expect(html).not.toContain('target="_blank"');
++        });
++
++        test('a markdown link to the real server opens inside this app', () => {
++            const html = format(`[post](${REAL}/acme/pl/abc)`, {siteURL: PROXY});
++            expect(html).toContain('data-link="/acme/pl/abc"');
++        });
++
++        test('an external link in a message still opens in a new tab', () => {
++            const html = format('see https://example.org/page', {siteURL: PROXY});
++            expect(html).toContain('href="https://example.org/page"');
++            expect(html).toContain('target="_blank"');
++        });
++
++        test('a bookmark to the real server opens inside this app', () => {
++            const bookmark = {type: 'link', link_url: `${REAL}/acme/channels/town-square`} as ChannelBookmark;
++            expect(shouldOpenBookmarkInNewTab(bookmark, PROXY)).toBe(false);
++        });
++
++        test('a bookmark to another site opens in a new tab', () => {
++            const bookmark = {type: 'link', link_url: 'https://example.org'} as ChannelBookmark;
++            expect(shouldOpenBookmarkInNewTab(bookmark, PROXY)).toBe(true);
++        });
++    });
++});
+diff --git a/webapp/channels/src/utils/public_site_url.ts b/webapp/channels/src/utils/public_site_url.ts
+new file mode 100644
+index 00000000..aa685492
+--- /dev/null
++++ b/webapp/channels/src/utils/public_site_url.ts
+@@ -0,0 +1,35 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import {getConfig} from 'mattermost-redux/selectors/entities/general';
++
++import store from 'stores/redux_store';
++
++import {getSiteURL} from 'utils/url';
++
++// When the webapp is served by a local proxy, getSiteURL() is the proxy's address, which nobody
++// else can open. The proxy reports the real server in ProxyUpstreamSiteURL: links that leave
++// this webapp (copied, forwarded, sent) use it, and links to it that come in are opened here.
++export function getPublicSiteURL(): string {
++    const config = getConfig(store.getState()) as {ProxyUpstreamSiteURL?: string};
++    return config.ProxyUpstreamSiteURL?.replace(/\/+$/, '') || getSiteURL();
++}
++
++export function toPublicURL(url: string): string {
++    return replacePrefix(url, getSiteURL(), getPublicSiteURL());
++}
++
++export function toLocalURL(url: string): string {
++    return replacePrefix(url, getPublicSiteURL(), getSiteURL());
++}
++
++function replacePrefix(url: string, from: string, to: string): string {
++    if (from === to || !url.startsWith(from)) {
++        return url;
++    }
++    const rest = url.substring(from.length);
++    if (rest && !(/^[/?#]/).test(rest)) {
++        return url;
++    }
++    return to + rest;
++}
