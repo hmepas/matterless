@@ -13,7 +13,7 @@ The webapp patches in `patches/` apply on top of upstream Mattermost `release-10
 - **Real server links behind the proxy.** Copied permalinks, forwarded posts, file links, invite URLs, and webhooks use the real server address instead of `http://localhost:9005`. Clicking a real server link in chat or bookmarks opens inside the local app.
 - **Visible failed sends.** Upstream silently removes a post on some send errors. The patch keeps every failed send visible with a red error icon and reports failures to the local proxy log.
 - **Independent SSO login.** The login screen and `/__auth` exchange a Mattermost `desktop_token` with the real server so the proxy holds its own session. You do not need a second server tab open in Mattermost Desktop.
-- **Crash and chunk recovery.** A root error boundary catches render crashes and stale lazy-chunk errors after a rebuild, offers recovery without a blank screen, and retries transient permalink load failures.
+- **Crash, VPN, and blank-screen telemetry.** A root error boundary catches render crashes and stale lazy-chunk errors, retries transient bootstrap/permalink failures, caps WebSocket backoff on VPN drops, and sends sanitized breadcrumbs, stack traces, heartbeats, and blank-screen watchdog snapshots to the local proxy (`telemetry.jsonl`).
 
 ## How it works
 
@@ -26,6 +26,7 @@ Mattermost Desktop or browser
         |-- /__all_teams_layout       -->  all-teams-layout.json
         |-- /__auth, /__auth/desktop  -->  SSO desktop_token exchange and cookie helper
         |-- /__client_log             -->  proxy.log  (ids and statuses only, mode 0600)
+        |-- /__telemetry              -->  telemetry.jsonl  (stacks, breadcrumbs, heartbeats, mode 0600)
         |-- /api/*, /plugins/*, /oauth/*, WebSocket  -->  real Mattermost server
 ```
 
@@ -106,8 +107,11 @@ All runtime settings can go in `session.env` or in the process environment.
 | `MM_DIST_DIR` | `./dist` | Built webapp directory |
 | `MM_ALL_TEAMS_LAYOUT_FILE` | `./all-teams-layout.json` | Persisted ALL-mode categories and channel order |
 | `MM_SESSION_FILE` | `./session.json` | Persisted session cookies updated on login and cleared on logout or 401 |
-| `MM_PROXY_LOG` | `./proxy.log` | Audit log for sends, errors, and WebSocket drops, rotated at 10 MB |
+| `MM_PROXY_LOG` | `./proxy.log` | Audit log for sends, errors, page loads, and WebSocket drops, rotated at 10 MB |
+| `MM_PROXY_LOG_STDOUT` | `0` | Set to `1` (or pass `./run.sh --stdout`) to mirror `proxy.log` lines to stdout |
+| `MM_TELEMETRY_LOG` | `./telemetry.jsonl` | Structured client telemetry (stacks, breadcrumbs, heartbeats, blank-screen snapshots), mode `0600` |
 | `MM_PROXY_POST_TIMEOUT_MS` | `30000` | Timeout for `POST /api/v4/posts` before returning `504` |
+| `MM_PROXY_GET_TIMEOUT_MS` | `30000` | Timeout for `GET`/`HEAD` requests before retrying reused sockets or returning `504` |
 | `MM_PROXY_PING_TIMEOUT_MS` | `5000` | Timeout for upstream reachability check before serving HTML |
 | `MM_SESSION_TOKEN`, `MM_SESSION_USERID`, `MM_SESSION_CSRF` | empty | Optional manual cookie seed if you do not use `/login` or `/__auth` |
 
@@ -143,4 +147,4 @@ Run webapp tests through `test.sh`, never plain `npx jest`. Plain Jest spawns a 
 - `run.sh`: loads `session.env` and starts `proxy.mjs`.
 - `update.sh`: rebases `src/` onto upstream, verifies, and rebuilds.
 - `test.sh`: memory-capped Jest wrapper running with `--maxWorkers=2` and `1G` idle worker limit.
-- Ignored local runtime files: `src/`, `dist/`, `dist.prev/`, `session.env`, `session.json`, `all-teams-layout.json`, `proxy.log`.
+- Ignored local runtime files: `src/`, `dist/`, `dist.prev/`, `session.env`, `session.json`, `all-teams-layout.json`, `proxy.log`, `telemetry.jsonl`.

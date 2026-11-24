@@ -11,6 +11,7 @@ session.json
 
 # Logs from installs, typechecks and dev-server runs
 *.log
+*.jsonl
 
 # Build artifacts and dependencies
 node_modules/

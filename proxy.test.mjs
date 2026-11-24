@@ -17,6 +17,7 @@ const dist = path.join(dir, 'dist');
 const prevDist = `${dist}.prev`;
 const layoutFile = path.join(dir, 'layout.json');
 const logFile = path.join(dir, 'proxy.log');
+const telemetryFile = path.join(dir, 'telemetry.jsonl');
 const HASHED = 'main.0123456789abcdef0123.js';
 const PREV_HASHED = 'chunk.fedcba9876543210abcd.js';
 
@@ -26,7 +27,9 @@ let port;
 let proxy;
 let last;
 let closeNextReused = false;
+let hangNextReused = false;
 let resetOnceCount = 0;
+let wsResetOnce = false;
 
 const freePort = () => new Promise((resolve) => {
     const probe = net.createServer().listen(0, 'localhost', () => {
@@ -35,9 +38,9 @@ const freePort = () => new Promise((resolve) => {
     });
 });
 
-function startProxy(proxyPort, targetPort, extraEnv = {}) {
+function startProxy(proxyPort, targetPort, extraEnv = {}, extraArgs = []) {
     return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [path.join(import.meta.dirname, 'proxy.mjs')], {
+        const child = spawn(process.execPath, [path.join(import.meta.dirname, 'proxy.mjs'), ...extraArgs], {
             env: {
                 PATH: process.env.PATH,
                 MM_SERVICESETTINGS_SITEURL: `http://localhost:${targetPort}/`,
@@ -46,6 +49,7 @@ function startProxy(proxyPort, targetPort, extraEnv = {}) {
                 MM_ALL_TEAMS_LAYOUT_FILE: layoutFile,
                 MM_PROXY_LOG: logFile,
                 MM_PROXY_POST_TIMEOUT_MS: '300',
+                MM_PROXY_GET_TIMEOUT_MS: '300',
                 MM_SESSION_TOKEN: 'tok',
                 MM_SESSION_USERID: 'uid',
                 MM_SESSION_CSRF: 'csrf',
@@ -88,6 +92,13 @@ before(async () => {
             if (closeNextReused && req.url === '/api/reuse-2') {
                 closeNextReused = false;
                 req.socket.destroy();
+                return;
+            }
+            if (hangNextReused && req.url === '/api/reuse-hang') {
+                hangNextReused = false;
+                return;
+            }
+            if (req.url === '/api/hang-get') {
                 return;
             }
             if (req.url === '/api/reset-once' && resetOnceCount === 0) {
@@ -136,6 +147,11 @@ before(async () => {
     });
     upstream.on('upgrade', (req, socket) => {
         last = {url: req.url, headers: req.headers};
+        if (wsResetOnce) {
+            wsResetOnce = false;
+            socket.destroy();
+            return;
+        }
         socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
         socket.on('data', (chunk) => socket.write(`echo:${chunk}`));
         socket.on('end', () => socket.end());
@@ -155,7 +171,7 @@ after(() => {
 });
 
 test('a foreign Host header is refused everywhere and gets no cookies', async () => {
-    for (const reqPath of ['/', '/__auth', '/__all_teams_layout', '/api/x', `/static/${HASHED}`]) {
+    for (const reqPath of ['/', '/__auth', '/__all_teams_layout', '/__telemetry', '/api/x', `/static/${HASHED}`]) {
         const res = await rq({path: reqPath, headers: {host: 'evil.example', accept: 'text/html'}});
         assert.equal(res.status, 403, reqPath);
         assert.equal(res.headers['set-cookie'], undefined);
@@ -163,13 +179,17 @@ test('a foreign Host header is refused everywhere and gets no cookies', async ()
 });
 
 test('app routes get root.html, assets and unknown files do not', async () => {
-    const page = await rq({path: '/team/channels/town-square', headers: {accept: 'text/html'}});
-    assert.equal(page.status, 200);
-    assert.equal(page.body, '<html>app</html>');
-    assert.equal(page.headers['cache-control'], 'no-cache');
+    for (const appPath of ['/team/channels/town-square', '/team/messages/@ivan.petrov', '/team/messages/@alex.js', '/team/channels/release-10.10']) {
+        const page = await rq({path: appPath, headers: {accept: 'text/html'}});
+        assert.equal(page.status, 200, appPath);
+        assert.equal(page.body, '<html>app</html>', appPath);
+        assert.equal(page.headers['cache-control'], 'no-cache', appPath);
+    }
 
     assert.equal((await rq({path: '/team/channels/x', headers: {accept: 'application/json'}})).status, 404);
     assert.equal((await rq({path: '/favicon.ico', headers: {accept: 'text/html'}})).status, 404);
+    assert.equal((await rq({path: '/robots.txt', headers: {accept: 'text/html'}})).status, 404);
+    assert.match(await logLineWith('unhandled GET /robots.txt'), /status=404$/);
 });
 
 test('session cookies are set only when the token differs', async () => {
@@ -281,6 +301,14 @@ test('websockets from another origin or host are refused', async () => {
     assert.equal((await openSocket({host: 'evil.example'})).status, 403);
 });
 
+test('a websocket upgrade reset by upstream is retried once', async () => {
+    wsResetOnce = true;
+    const {status, socket} = await openSocket({origin: `http://localhost:${port}`});
+    assert.equal(status, 101);
+    assert.equal(wsResetOnce, false);
+    socket.destroy();
+});
+
 test('a keep-alive connection closed by upstream is retried for GET', async () => {
     const agent = new http.Agent({keepAlive: true});
     const get = (reqPath) => new Promise((resolve, reject) => {
@@ -294,6 +322,11 @@ test('a keep-alive connection closed by upstream is retried for GET', async () =
     assert.equal(await get('/api/reuse-2'), 200);
     resetOnceCount = 0;
     assert.equal((await rq({path: '/api/reset-once'})).status, 200);
+    assert.equal(await get('/api/reuse-1'), 200);
+    hangNextReused = true;
+    assert.equal(await get('/api/reuse-hang'), 200);
+    assert.equal(hangNextReused, false);
+    assert.equal((await rq({path: '/api/hang-get'})).status, 504);
     agent.destroy();
 });
 
@@ -522,4 +555,109 @@ test('page reports are logged with known fields only, and neutralized', async ()
 
 test('the log is private to the user', () => {
     assert.equal(fs.statSync(logFile).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(telemetryFile).mode & 0o777, 0o600);
+});
+
+const readTelemetry = () => (
+    fs.existsSync(telemetryFile)
+        ? fs.readFileSync(telemetryFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+        : []
+);
+
+test('structured telemetry is sanitized, enriched with proxy state, and written to telemetry.jsonl + proxy.log', async () => {
+    const send = (body, headers = {'content-type': 'application/json'}) => rq({path: '/__telemetry', method: 'POST', headers, body});
+
+    const res = await send(JSON.stringify({
+        event: 'blank_screen',
+        tab_id: 'tab123',
+        bundle_id: HASHED,
+        route: '/team/channels/town-square?secret=1#hash',
+        component: 'Root',
+        online: true,
+        visibility: 'visible',
+        ws_state: 'closed',
+        uptime_s: 42.4,
+        message: 'top secret message body',
+        cookie: 'MMAUTHTOKEN=secret',
+        error: {
+            name: 'TypeError',
+            message: 'cannot read x\nforged',
+            stack: ['at render (http://localhost:9005/static/main.js?token=abc:10:2)'],
+            component_stack: ['in Root', 'in App'],
+        },
+        dom: {
+            root_children: 1,
+            root_text_len: 0,
+            loading_visible: false,
+            has_current_user: true,
+            teams_count: 2,
+            evil_field: 'drop-me',
+        },
+        breadcrumbs: [
+            {ts: '2026-11-24T17:00:00.000Z', cat: 'http', msg: 'GET /api/v4/users/me?tok=1', route: '/team/channels/a?x=1', status: 502, ms: 310},
+        ],
+    }));
+    assert.equal(res.status, 204);
+
+    const logLine = await logLineWith('telemetry event=blank_screen tab=tab123');
+    assert.match(logLine, /route=\/team\/channels\/town-square ws=closed online=true component=Root error=TypeError:cannot_read_x_forged$/);
+
+    const records = readTelemetry();
+    assert.ok(records.some((r) => r.event === 'proxy_start'));
+    const entry = records.find((r) => r.event === 'blank_screen' && r.tab_id === 'tab123');
+    assert.ok(entry);
+    assert.equal(entry.route, '/team/channels/town-square');
+    assert.equal(entry.message, undefined);
+    assert.equal(entry.cookie, undefined);
+    assert.deepEqual(entry.error.stack, ['at render (http://localhost:9005/static/main.js:10:2)']);
+    assert.deepEqual(entry.dom, {root_children: 1, root_text_len: 0, loading_visible: false, has_current_user: true, teams_count: 2});
+    assert.equal(entry.breadcrumbs[0].msg, 'GET /api/v4/users/me');
+    assert.equal(entry.breadcrumbs[0].route, '/team/channels/a');
+    assert.equal(typeof entry.proxy.pid, 'number');
+    assert.equal(typeof entry.proxy.uptime_s, 'number');
+    assert.ok(Array.isArray(entry.proxy.recent_upstream_errors));
+    assert.doesNotMatch(fs.readFileSync(telemetryFile, 'utf8'), /top secret|MMAUTHTOKEN=secret|drop-me/);
+
+    assert.equal((await send('{', {'content-type': 'application/json'})).status, 400);
+    assert.equal((await send('{}', {'content-type': 'application/json'})).status, 400);
+    assert.equal((await send(JSON.stringify({event: 'x', pad: 'a'.repeat(70 * 1024)}), {'content-type': 'application/json'})).status, 413);
+    assert.equal((await send('{}', {'content-type': 'text/plain'})).status, 403);
+    assert.equal((await send('{}', {'content-type': 'application/json', origin: 'https://evil.example'})).status, 403);
+    assert.equal((await rq({path: '/__telemetry'})).status, 405);
+});
+
+test('log mirroring to stdout is off by default and enabled via --stdout', async () => {
+    const quietPort = await freePort();
+    const quietLog = path.join(dir, 'quiet.log');
+    const quietChild = await startProxy(quietPort, upstreamPort, {MM_PROXY_LOG: quietLog});
+    let quietOut = '';
+    quietChild.stdout.on('data', (chunk) => {
+        quietOut += chunk.toString();
+    });
+    try {
+        await rq({path: '/__client_log', method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({event: 'quiet_check'}), toPort: quietPort});
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.match(fs.readFileSync(quietLog, 'utf8'), /client event=quiet_check/);
+        assert.doesNotMatch(quietOut, /quiet_check/);
+    } finally {
+        quietChild.removeAllListeners('exit');
+        quietChild.kill();
+    }
+
+    const loudPort = await freePort();
+    const loudLog = path.join(dir, 'loud.log');
+    const loudChild = await startProxy(loudPort, upstreamPort, {MM_PROXY_LOG: loudLog}, ['--stdout']);
+    let loudOut = '';
+    loudChild.stdout.on('data', (chunk) => {
+        loudOut += chunk.toString();
+    });
+    try {
+        await rq({path: '/__client_log', method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({event: 'loud_check'}), toPort: loudPort});
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.match(fs.readFileSync(loudLog, 'utf8'), /client event=loud_check/);
+        assert.match(loudOut, /client event=loud_check/);
+    } finally {
+        loudChild.removeAllListeners('exit');
+        loudChild.kill();
+    }
 });

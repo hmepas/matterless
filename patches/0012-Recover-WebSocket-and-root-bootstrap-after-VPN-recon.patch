@@ -1,0 +1,789 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 24 Nov 2026 20:12:22 +0300
+Subject: [PATCH] Recover WebSocket and root bootstrap after VPN reconnect
+
+Cap WebSocket reconnect backoff at 15s, retry promptly on focus/online/visibilitychange, and probe apparently open sockets on resume so half-open connections close within 5s. Also treat transient 5xx/network failures during initial config/me/teams bootstrap as retryable instead of logging out or sticking on a blank Root div.
+---
+ .../src/client/web_websocket_client.test.tsx  | 183 ++++++++++++++++++
+ .../src/client/web_websocket_client.tsx       | 154 ++++++++++++++-
+ .../src/components/root/actions/index.test.ts |  56 +++++-
+ .../src/components/root/actions/index.ts      |  25 ++-
+ .../src/components/root/root.test.tsx         |  31 ++-
+ webapp/channels/src/components/root/root.tsx  | 165 ++++++++++++++--
+ 6 files changed, 595 insertions(+), 19 deletions(-)
+ create mode 100644 webapp/channels/src/client/web_websocket_client.test.tsx
+
+diff --git a/webapp/channels/src/client/web_websocket_client.test.tsx b/webapp/channels/src/client/web_websocket_client.test.tsx
+new file mode 100644
+index 00000000..d15412ca
+--- /dev/null
++++ b/webapp/channels/src/client/web_websocket_client.test.tsx
+@@ -0,0 +1,183 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import {ResilientWebSocketClient} from './web_websocket_client';
++
++class FakeWebSocket {
++    static readonly CONNECTING = 0;
++    static readonly OPEN = 1;
++    static readonly CLOSING = 2;
++    static readonly CLOSED = 3;
++
++    static instances: FakeWebSocket[] = [];
++
++    url: string;
++    readyState = FakeWebSocket.CONNECTING;
++    sent: string[] = [];
++    onopen: (() => void) | null = null;
++    onclose: (() => void) | null = null;
++    onerror: ((err: Event) => void) | null = null;
++    onmessage: ((evt: {data: string}) => void) | null = null;
++
++    constructor(url: string) {
++        this.url = url;
++        FakeWebSocket.instances.push(this);
++    }
++
++    send(data: string) {
++        this.sent.push(data);
++    }
++
++    close() {
++        this.readyState = FakeWebSocket.CLOSED;
++        this.onclose?.();
++    }
++
++    triggerOpen() {
++        this.readyState = FakeWebSocket.OPEN;
++        this.onopen?.();
++    }
++
++    triggerClose() {
++        this.readyState = FakeWebSocket.CLOSED;
++        this.onclose?.();
++    }
++
++    triggerMessage(payload: unknown) {
++        this.onmessage?.({data: JSON.stringify(payload)});
++    }
++}
++
++describe('ResilientWebSocketClient', () => {
++    const originalWebSocket = global.WebSocket;
++    let clients: ResilientWebSocketClient[] = [];
++
++    const createClient = () => {
++        const client = new ResilientWebSocketClient();
++        clients.push(client);
++        return client;
++    };
++
++    beforeEach(() => {
++        jest.useFakeTimers();
++        FakeWebSocket.instances = [];
++        clients = [];
++        (global as unknown as {WebSocket: typeof FakeWebSocket}).WebSocket = FakeWebSocket;
++    });
++
++    afterEach(() => {
++        for (const client of clients) {
++            client.close();
++        }
++        clients = [];
++        jest.useRealTimers();
++        (global as unknown as {WebSocket: typeof WebSocket}).WebSocket = originalWebSocket;
++    });
++
++    test('caps reconnect backoff at 15s after repeated failures', () => {
++        const client = createClient();
++        client.initialize('ws://localhost:9005/api/v4/websocket');
++
++        // Fail 10 consecutive attempts (exceeding maxWebSocketFails = 7).
++        for (let i = 0; i < 10; i++) {
++            const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
++            ws.triggerClose();
++            jest.advanceTimersByTime(17001);
++        }
++
++        // After 10 failures, next retry must still occur within 15s + 2s jitter (not 5 minutes).
++        const countBefore = FakeWebSocket.instances.length;
++        const latest = FakeWebSocket.instances[countBefore - 1];
++        latest.triggerClose();
++
++        jest.advanceTimersByTime(17001);
++        expect(FakeWebSocket.instances.length).toBe(countBefore + 1);
++    });
++
++    test('reconnects promptly on window focus and still fires reconnect listeners', () => {
++        const client = createClient();
++        const reconnectListener = jest.fn();
++        const firstConnectListener = jest.fn();
++        client.addReconnectListener(reconnectListener);
++        client.addFirstConnectListener(firstConnectListener);
++
++        client.initialize('ws://localhost:9005/api/v4/websocket');
++        FakeWebSocket.instances[0].triggerOpen();
++        expect(firstConnectListener).toHaveBeenCalledTimes(1);
++
++        // Simulate VPN drop with repeated failures pushing into backoff.
++        for (let i = 0; i < 8; i++) {
++            FakeWebSocket.instances[FakeWebSocket.instances.length - 1].triggerClose();
++            if (i < 7) {
++                jest.advanceTimersByTime(5100);
++            }
++        }
++
++        const countBeforeFocus = FakeWebSocket.instances.length;
++
++        // Focusing the window cancels the backoff timer and retries immediately after debounce.
++        window.dispatchEvent(new Event('focus'));
++        jest.advanceTimersByTime(300);
++
++        expect(FakeWebSocket.instances.length).toBe(countBeforeFocus + 1);
++
++        // Once the new socket opens, reconnectListeners (not firstConnectListeners) must run.
++        FakeWebSocket.instances[FakeWebSocket.instances.length - 1].triggerOpen();
++        expect(reconnectListener).toHaveBeenCalledTimes(1);
++        expect(firstConnectListener).toHaveBeenCalledTimes(1);
++    });
++
++    test('closes a half-open socket if ping gets no reply on resume', () => {
++        const client = createClient();
++        client.initialize('ws://localhost:9005/api/v4/websocket');
++        const ws = FakeWebSocket.instances[0];
++        ws.triggerOpen();
++
++        // Simulate returning to the window while the socket is half-open (no pong arrives).
++        window.dispatchEvent(new Event('online'));
++        jest.advanceTimersByTime(300);
++
++        expect(ws.sent.some((msg) => msg.includes('"action":"ping"'))).toBe(true);
++
++        // After the 5s health probe timeout, the zombie socket is closed so reconnect can start.
++        jest.advanceTimersByTime(5000);
++        expect(ws.readyState).toBe(FakeWebSocket.CLOSED);
++
++        // And a fresh socket is opened after the initial 3s retry wait (+ up to 2s jitter).
++        jest.advanceTimersByTime(5100);
++        expect(FakeWebSocket.instances.length).toBe(2);
++    });
++
++    test('keeps a healthy socket open when ping receives a reply on resume', () => {
++        const client = createClient();
++        client.initialize('ws://localhost:9005/api/v4/websocket');
++        const ws = FakeWebSocket.instances[0];
++        ws.triggerOpen();
++
++        window.dispatchEvent(new Event('focus'));
++        jest.advanceTimersByTime(300);
++
++        const pingMsg = JSON.parse(ws.sent[ws.sent.length - 1]);
++        expect(pingMsg.action).toBe('ping');
++
++        // Server answers pong before the 5s timeout.
++        ws.triggerMessage({seq_reply: pingMsg.seq, status: 'OK'});
++
++        jest.advanceTimersByTime(6000);
++        expect(ws.readyState).toBe(FakeWebSocket.OPEN);
++        expect(FakeWebSocket.instances.length).toBe(1);
++    });
++
++    test('does not reconnect on focus after explicit close', () => {
++        const client = createClient();
++        client.initialize('ws://localhost:9005/api/v4/websocket');
++        client.close();
++
++        const countAfterClose = FakeWebSocket.instances.length;
++        window.dispatchEvent(new Event('focus'));
++        window.dispatchEvent(new Event('online'));
++        jest.advanceTimersByTime(1000);
++
++        expect(FakeWebSocket.instances.length).toBe(countAfterClose);
++    });
++});
+diff --git a/webapp/channels/src/client/web_websocket_client.tsx b/webapp/channels/src/client/web_websocket_client.tsx
+index 2491cd9b..46d0b57a 100644
+--- a/webapp/channels/src/client/web_websocket_client.tsx
++++ b/webapp/channels/src/client/web_websocket_client.tsx
+@@ -1,7 +1,159 @@
+ // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+ // See LICENSE.txt for license information.
+ 
++// PATCH(all-teams): cap WebSocket reconnect backoff at 15s (instead of upstream's 5 minutes) and
++// recover promptly when the window regains focus, visibility, or network connectivity after a
++// VPN drop or sleep. Also probe an apparently open socket on resume so half-open connections are
++// closed within 5s instead of waiting for the full 30-60s ping interval.
++
+ import {WebSocketClient} from '@mattermost/client';
+ 
+-const WebClient = new WebSocketClient();
++const MAX_RETRY_TIME_MS = 15000;
++const RESUME_DEBOUNCE_MS = 250;
++const HEALTH_PROBE_TIMEOUT_MS = 5000;
++
++type WebSocketClientInternals = {
++    conn: WebSocket | null;
++    connectFailCount: number;
++};
++
++export class ResilientWebSocketClient extends WebSocketClient {
++    private active = false;
++    private lastConnectionUrl?: string;
++    private lastToken?: string;
++    private lastPostedAck?: boolean;
++    private listenersAttached = false;
++    private resumeTimer: ReturnType<typeof setTimeout> | null = null;
++    private probeTimer: ReturnType<typeof setTimeout> | null = null;
++
++    constructor() {
++        super({
++            maxWebSocketRetryTime: MAX_RETRY_TIME_MS,
++        });
++    }
++
++    private internals(): WebSocketClientInternals {
++        return this as unknown as WebSocketClientInternals;
++    }
++
++    public initialize(connectionUrl: string, token?: string, postedAck?: boolean): void {
++        if (connectionUrl) {
++            this.lastConnectionUrl = connectionUrl;
++        }
++        if (token !== undefined) {
++            this.lastToken = token;
++        }
++        if (postedAck !== undefined) {
++            this.lastPostedAck = postedAck;
++        }
++        this.active = true;
++        this.attachResumeListeners();
++        super.initialize(connectionUrl, token, postedAck);
++    }
++
++    public close(): void {
++        this.active = false;
++        this.detachResumeListeners();
++        this.clearTimers();
++        super.close();
++    }
++
++    private attachResumeListeners(): void {
++        if (this.listenersAttached || typeof window === 'undefined') {
++            return;
++        }
++        this.listenersAttached = true;
++        window.addEventListener('online', this.handleResume);
++        window.addEventListener('focus', this.handleResume);
++        if (typeof document !== 'undefined') {
++            document.addEventListener('visibilitychange', this.handleVisibilityChange);
++        }
++    }
++
++    private detachResumeListeners(): void {
++        if (!this.listenersAttached || typeof window === 'undefined') {
++            return;
++        }
++        this.listenersAttached = false;
++        window.removeEventListener('online', this.handleResume);
++        window.removeEventListener('focus', this.handleResume);
++        if (typeof document !== 'undefined') {
++            document.removeEventListener('visibilitychange', this.handleVisibilityChange);
++        }
++    }
++
++    private clearTimers(): void {
++        if (this.resumeTimer) {
++            clearTimeout(this.resumeTimer);
++            this.resumeTimer = null;
++        }
++        if (this.probeTimer) {
++            clearTimeout(this.probeTimer);
++            this.probeTimer = null;
++        }
++    }
++
++    private handleVisibilityChange = (): void => {
++        if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
++            this.handleResume();
++        }
++    };
++
++    private handleResume = (): void => {
++        if (!this.active || !this.lastConnectionUrl) {
++            return;
++        }
++        if (this.resumeTimer) {
++            clearTimeout(this.resumeTimer);
++        }
++        this.resumeTimer = setTimeout(() => {
++            this.resumeTimer = null;
++            this.checkOrReconnect();
++        }, RESUME_DEBOUNCE_MS);
++    };
++
++    private checkOrReconnect(): void {
++        if (!this.active || !this.lastConnectionUrl) {
++            return;
++        }
++        const internals = this.internals();
++        const conn = internals.conn;
++        const openState = typeof WebSocket === 'undefined' ? 1 : WebSocket.OPEN;
++        const closedState = typeof WebSocket === 'undefined' ? 3 : WebSocket.CLOSED;
++
++        if (!conn || conn.readyState === closedState) {
++            this.clearReconnectTimeout();
++
++            // Keep connectFailCount at >= 1 when recovering from prior failures so WebSocketClient's
++            // onopen still fires reconnectListeners (syncing missed posts/unreads), while resetting
++            // any deep exponential backoff back to the initial 3s retry interval.
++            if (internals.connectFailCount > 1) {
++                internals.connectFailCount = 1;
++            }
++            super.initialize(this.lastConnectionUrl, this.lastToken, this.lastPostedAck);
++            return;
++        }
++
++        if (conn.readyState === openState && !this.probeTimer) {
++            const probedConn = conn;
++            this.probeTimer = setTimeout(() => {
++                this.probeTimer = null;
++                if (this.internals().conn === probedConn && probedConn.readyState === openState) {
++                    const prevOnClose = probedConn.onclose;
++                    probedConn.onclose = null;
++                    probedConn.close();
++                    prevOnClose?.call(probedConn, {code: 1006, wasClean: false} as CloseEvent);
++                }
++            }, HEALTH_PROBE_TIMEOUT_MS);
++            this.ping(() => {
++                if (this.probeTimer) {
++                    clearTimeout(this.probeTimer);
++                    this.probeTimer = null;
++                }
++            });
++        }
++    }
++}
++
++const WebClient = new ResilientWebSocketClient();
+ export default WebClient;
+diff --git a/webapp/channels/src/components/root/actions/index.test.ts b/webapp/channels/src/components/root/actions/index.test.ts
+index 47c35dd3..0da2fcce 100644
+--- a/webapp/channels/src/components/root/actions/index.test.ts
++++ b/webapp/channels/src/components/root/actions/index.test.ts
+@@ -3,14 +3,17 @@
+ 
+ import mockStore from 'tests/test_store';
+ 
++import * as GeneralActions from 'mattermost-redux/actions/general';
++import * as UserActions from 'mattermost-redux/actions/users';
++
+ import {loadConfigAndMe} from './index';
+ 
+ jest.mock('mattermost-redux/actions/general', () => {
+     const original = jest.requireActual('mattermost-redux/actions/general');
+     return {
+         ...original,
+-        getClientConfig: () => ({type: 'MOCK_GET_CLIENT_CONFIG'}),
+-        getLicenseConfig: () => ({type: 'MOCK_GET_LICENSE_CONFIG'}),
++        getClientConfig: jest.fn(() => ({type: 'MOCK_GET_CLIENT_CONFIG'})),
++        getLicenseConfig: jest.fn(() => ({type: 'MOCK_GET_LICENSE_CONFIG'})),
+     };
+ });
+ 
+@@ -18,7 +21,7 @@ jest.mock('mattermost-redux/actions/users', () => {
+     const original = jest.requireActual('mattermost-redux/actions/users');
+     return {
+         ...original,
+-        getMe: () => ({type: 'MOCK_LOAD_ME'}),
++        getMe: jest.fn(() => ({type: 'MOCK_LOAD_ME'})),
+     };
+ });
+ 
+@@ -89,4 +92,51 @@ describe('loadConfigAndMe', () => {
+             {type: 'MOCK_GET_SERVER_LIMITS'},
+         ]);
+     });
++
++    test('returns isLoaded: false on transient 502 client config error', async () => {
++        (GeneralActions.getClientConfig as jest.Mock).mockImplementationOnce(() => ({
++            type: 'MOCK_GET_CLIENT_CONFIG_FAIL',
++            error: {status_code: 502, message: 'Bad Gateway'},
++        }));
++
++        const testStore = mockStore({});
++        const result = await testStore.dispatch(loadConfigAndMe());
++        expect(result).toEqual({isLoaded: false});
++    });
++
++    test('returns isLoaded: false on transient 502 getMe error instead of proceeding without user', async () => {
++        (UserActions.getMe as jest.Mock).mockImplementationOnce(() => ({
++            type: 'MOCK_LOAD_ME_FAIL',
++            error: {status_code: 502, message: 'Bad Gateway'},
++        }));
++
++        const testStore = mockStore({
++            entities: {
++                general: {serverVersion: '1.0.0'},
++                users: {currentUserId: 'userid'},
++            },
++        });
++        document.cookie = 'MMUSERID=userid';
++
++        const result = await testStore.dispatch(loadConfigAndMe());
++        expect(result).toEqual({isLoaded: false});
++    });
++
++    test('still returns isLoaded: true on 401 getMe so normal login redirect works', async () => {
++        (UserActions.getMe as jest.Mock).mockImplementationOnce(() => ({
++            type: 'MOCK_LOAD_ME_401',
++            error: {status_code: 401, message: 'Unauthorized'},
++        }));
++
++        const testStore = mockStore({
++            entities: {
++                general: {serverVersion: '1.0.0'},
++                users: {currentUserId: 'userid'},
++            },
++        });
++        document.cookie = 'MMUSERID=userid';
++
++        const result = await testStore.dispatch(loadConfigAndMe());
++        expect(result).toEqual({isLoaded: true, isMeRequested: true});
++    });
+ });
+diff --git a/webapp/channels/src/components/root/actions/index.ts b/webapp/channels/src/components/root/actions/index.ts
+index 04b7a71a..861fc5e8 100644
+--- a/webapp/channels/src/components/root/actions/index.ts
++++ b/webapp/channels/src/components/root/actions/index.ts
+@@ -29,6 +29,17 @@ import type {Translations} from 'types/store/i18n';
+ 
+ export type TranslationPluginFunction = (locale: string) => Translations
+ 
++// PATCH(all-teams): treat transient 5xx/network failures during initial bootstrap as not loaded
++// so Root can retry instead of mounting LoggedIn with an empty user/config and forcing logout.
++function isTransientBootstrapError(result: unknown): boolean {
++    const error = (result as {error?: {status_code?: number}} | undefined)?.error;
++    if (!error) {
++        return false;
++    }
++    const status = error.status_code;
++    return status === undefined || status === 0 || status >= 500;
++}
++
+ /**
+  * This function meant to be used in root.tsx component loads config, license and if user is logged in, it loads user and its related data.
+  */
+@@ -36,10 +47,15 @@ export function loadConfigAndMe(): ThunkActionFunc<Promise<{isLoaded: boolean; i
+     return async (dispatch, getState) => {
+         // attempt to load config and license regardless if user is logged in or not
+         try {
+-            await Promise.all([
++            const [configResult] = await Promise.all([
+                 dispatch(getClientConfig()),
+                 dispatch(getLicenseConfig()),
+             ]);
++            if (isTransientBootstrapError(configResult)) {
++                return {
++                    isLoaded: false,
++                };
++            }
+         } catch (error) {
+             dispatch(logError(error as ServerError));
+             return {
+@@ -60,12 +76,17 @@ export function loadConfigAndMe(): ThunkActionFunc<Promise<{isLoaded: boolean; i
+         dispatch({type: GeneralTypes.RECEIVED_SERVER_VERSION, data: serverVersion});
+ 
+         try {
+-            await Promise.all([
++            const [meResult, , teamsResult] = await Promise.all([
+                 dispatch(getMe()),
+                 dispatch(getMyPreferences()),
+                 dispatch(getMyTeams()),
+                 dispatch(getMyTeamMembers()),
+             ]);
++            if (isTransientBootstrapError(meResult) || isTransientBootstrapError(teamsResult)) {
++                return {
++                    isLoaded: false,
++                };
++            }
+ 
+             dispatch(getMyTeamUnreads(isCollapsedThreadsEnabled(getState())));
+             dispatch(getServerLimits());
+diff --git a/webapp/channels/src/components/root/root.test.tsx b/webapp/channels/src/components/root/root.test.tsx
+index 8a7be935..d237ab84 100644
+--- a/webapp/channels/src/components/root/root.test.tsx
++++ b/webapp/channels/src/components/root/root.test.tsx
+@@ -13,7 +13,7 @@ import type {Theme} from 'mattermost-redux/selectors/entities/preferences';
+ import * as GlobalActions from 'actions/global_actions';
+ 
+ import testConfigureStore from 'packages/mattermost-redux/test/test_store';
+-import {renderWithContext, waitFor} from 'tests/react_testing_utils';
++import {fireEvent, renderWithContext, screen, waitFor} from 'tests/react_testing_utils';
+ import {StoragePrefixes} from 'utils/constants';
+ import * as Utils from 'utils/utils';
+ 
+@@ -413,6 +413,35 @@ describe('components/Root', () => {
+             expect(Utils.applyTheme).not.toHaveBeenCalled();
+         });
+     });
++
++    describe('bootstrap retry recovery', () => {
++        test('shows recovery screen instead of blank div when loadConfigAndMe fails and recovers on retry', async () => {
++            const loadConfigAndMe = jest.fn().
++                mockResolvedValueOnce({isLoaded: false}).
++                mockResolvedValueOnce({isLoaded: true, isMeRequested: false});
++
++            const props = {
++                ...baseProps,
++                actions: {
++                    ...baseProps.actions,
++                    loadConfigAndMe,
++                },
++            };
++
++            renderWithContext(<Root {...props}/>);
++
++            await waitFor(() => {
++                expect(screen.getByTestId('root-bootstrap-retry')).toBeInTheDocument();
++            });
++
++            fireEvent.click(screen.getByRole('button', {name: 'Повторить сейчас'}));
++
++            await waitFor(() => {
++                expect(loadConfigAndMe).toHaveBeenCalledTimes(2);
++                expect(screen.queryByTestId('root-bootstrap-retry')).not.toBeInTheDocument();
++            });
++        });
++    });
+ });
+ 
+ describe('doesRouteBelongToTeamControllerRoutes', () => {
+diff --git a/webapp/channels/src/components/root/root.tsx b/webapp/channels/src/components/root/root.tsx
+index 89348bc3..86a2c91a 100644
+--- a/webapp/channels/src/components/root/root.tsx
++++ b/webapp/channels/src/components/root/root.tsx
+@@ -89,9 +89,16 @@ export type Props = PropsFromRedux & RouteComponentProps & {
+ 
+ interface State {
+     shouldMountAppRoutes?: boolean;
++    bootstrapFailed?: boolean;
+ }
+ 
++const BOOTSTRAP_RETRY_MS = 5000;
++
+ export default class Root extends React.PureComponent<Props, State> {
++    private bootstrapRetryTimer: ReturnType<typeof setTimeout> | null = null;
++    private bootstrapInFlight = false;
++    private isUnmounted = false;
++
+     // The constructor adds a bunch of event listeners,
+     // so we do need this.
+     constructor(props: Props) {
+@@ -106,6 +113,7 @@ export default class Root extends React.PureComponent<Props, State> {
+ 
+         this.state = {
+             shouldMountAppRoutes: false,
++            bootstrapFailed: false,
+         };
+     }
+ 
+@@ -180,8 +188,12 @@ export default class Root extends React.PureComponent<Props, State> {
+         Promise.all([
+             this.props.actions.initializeProducts(),
+             initializePlugins(),
+-        ]).then(() => {
+-            this.setState({shouldMountAppRoutes: true});
++        ]).catch(() => {
++            // PATCH(all-teams): never let a transient plugin/product load failure leave a white screen.
++        }).then(() => {
++            if (!this.isUnmounted) {
++                this.setState({shouldMountAppRoutes: true});
++            }
+         });
+ 
+         this.props.actions.migrateRecentEmojis();
+@@ -322,21 +334,72 @@ export default class Root extends React.PureComponent<Props, State> {
+         return null;
+     }
+ 
++    private clearBootstrapRetryTimer = () => {
++        if (this.bootstrapRetryTimer) {
++            clearTimeout(this.bootstrapRetryTimer);
++            this.bootstrapRetryTimer = null;
++        }
++    };
++
++    private scheduleBootstrapRetry = () => {
++        this.clearBootstrapRetryTimer();
++        this.bootstrapRetryTimer = setTimeout(() => {
++            this.bootstrapRetryTimer = null;
++            this.initiateMeRequests();
++        }, BOOTSTRAP_RETRY_MS);
++    };
++
++    private handleBootstrapResume = () => {
++        if (this.state.bootstrapFailed && !this.state.shouldMountAppRoutes) {
++            this.initiateMeRequests();
++        }
++    };
++
+     initiateMeRequests = async () => {
+-        const {isLoaded, isMeRequested} = await this.props.actions.loadConfigAndMe();
++        if (this.bootstrapInFlight || this.isUnmounted) {
++            return;
++        }
++        this.bootstrapInFlight = true;
++        this.clearBootstrapRetryTimer();
+ 
+-        if (isLoaded) {
+-            const isUserAtRootRoute = this.props.location.pathname === '/';
++        try {
++            const {isLoaded, isMeRequested} = await this.props.actions.loadConfigAndMe();
+ 
+-            if (isUserAtRootRoute) {
+-                if (isMeRequested) {
+-                    this.props.actions.redirectToOnboardingOrDefaultTeam(this.props.history, new URLSearchParams(this.props.location.search));
+-                } else if (this.props.noAccounts) {
+-                    this.props.history.push('/signup_user_complete');
+-                }
++            if (this.isUnmounted) {
++                return;
+             }
+ 
+-            this.onConfigLoaded();
++            if (isLoaded) {
++                if (this.state.bootstrapFailed) {
++                    this.setState({bootstrapFailed: false});
++                }
++
++                const isUserAtRootRoute = this.props.location.pathname === '/';
++
++                if (isUserAtRootRoute) {
++                    if (isMeRequested) {
++                        this.props.actions.redirectToOnboardingOrDefaultTeam(this.props.history, new URLSearchParams(this.props.location.search));
++                    } else if (this.props.noAccounts) {
++                        this.props.history.push('/signup_user_complete');
++                    }
++                }
++
++                this.onConfigLoaded();
++            } else {
++                // PATCH(all-teams): avoid a permanent blank white screen if initial config/me fails
++                // during a VPN transition; show a recovery banner and auto-retry.
++                this.setState({bootstrapFailed: true});
++                InitialLoadingScreen.stop('root');
++                this.scheduleBootstrapRetry();
++            }
++        } catch {
++            if (!this.isUnmounted) {
++                this.setState({bootstrapFailed: true});
++                InitialLoadingScreen.stop('root');
++                this.scheduleBootstrapRetry();
++            }
++        } finally {
++            this.bootstrapInFlight = false;
+         }
+     };
+ 
+@@ -363,6 +426,8 @@ export default class Root extends React.PureComponent<Props, State> {
+ 
+         // Force logout of all tabs if one tab is logged out
+         window.addEventListener('storage', this.handleLogoutLoginSignal);
++        window.addEventListener('online', this.handleBootstrapResume);
++        window.addEventListener('focus', this.handleBootstrapResume);
+ 
+         // Prevent drag and drop files from navigating away from the app
+         document.addEventListener('drop', this.handleDropEvent);
+@@ -371,7 +436,11 @@ export default class Root extends React.PureComponent<Props, State> {
+     }
+ 
+     componentWillUnmount() {
++        this.isUnmounted = true;
++        this.clearBootstrapRetryTimer();
+         window.removeEventListener('storage', this.handleLogoutLoginSignal);
++        window.removeEventListener('online', this.handleBootstrapResume);
++        window.removeEventListener('focus', this.handleBootstrapResume);
+         document.removeEventListener('drop', this.handleDropEvent);
+         document.removeEventListener('dragover', this.handleDragOverEvent);
+     }
+@@ -394,6 +463,78 @@ export default class Root extends React.PureComponent<Props, State> {
+ 
+     render() {
+         if (!this.state.shouldMountAppRoutes) {
++            if (this.state.bootstrapFailed) {
++                return (
++                    <div
++                        data-testid='root-bootstrap-retry'
++                        style={{
++                            display: 'flex',
++                            alignItems: 'center',
++                            justifyContent: 'center',
++                            width: '100%',
++                            minHeight: '100vh',
++                            padding: '32px 16px',
++                            boxSizing: 'border-box',
++                            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
++                            color: '#222',
++                            backgroundColor: '#fff',
++                        }}
++                    >
++                        <div
++                            style={{
++                                maxWidth: '420px',
++                                width: '100%',
++                                padding: '20px 24px',
++                                border: '1px solid #d9dce1',
++                                borderRadius: '8px',
++                                backgroundColor: '#fff',
++                                boxShadow: '0 2px 10px rgba(0, 0, 0, 0.06)',
++                            }}
++                        >
++                            <h3 style={{margin: '0 0 8px', fontSize: '16px', fontWeight: 600}}>
++                                {'Нет связи с сервером'}
++                            </h3>
++                            <p style={{margin: '0 0 16px', fontSize: '13px', lineHeight: 1.5, color: '#555'}}>
++                                {'Проверьте VPN или сеть. Приложение автоматически повторит подключение через несколько секунд.'}
++                            </p>
++                            <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap'}}>
++                                <button
++                                    type='button'
++                                    onClick={this.initiateMeRequests}
++                                    style={{
++                                        padding: '7px 14px',
++                                        fontSize: '13px',
++                                        fontWeight: 600,
++                                        color: '#fff',
++                                        backgroundColor: '#1c58d9',
++                                        border: 'none',
++                                        borderRadius: '4px',
++                                        cursor: 'pointer',
++                                    }}
++                                >
++                                    {'Повторить сейчас'}
++                                </button>
++                                <button
++                                    type='button'
++                                    onClick={() => window.location.reload()}
++                                    style={{
++                                        padding: '7px 14px',
++                                        fontSize: '13px',
++                                        fontWeight: 600,
++                                        color: '#1c58d9',
++                                        backgroundColor: 'transparent',
++                                        border: '1px solid #1c58d9',
++                                        borderRadius: '4px',
++                                        cursor: 'pointer',
++                                    }}
++                                >
++                                    {'Перезагрузить'}
++                                </button>
++                            </div>
++                        </div>
++                    </div>
++                );
++            }
+             return <div/>;
+         }
+ 

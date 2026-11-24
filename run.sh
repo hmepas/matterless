@@ -19,4 +19,4 @@ if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
     source "${NVM_DIR:-$HOME/.nvm}/nvm.sh" && nvm use 24 >/dev/null 2>&1 || true
 fi
 export MM_SERVICESETTINGS_SITEURL
-exec node proxy.mjs
+exec node proxy.mjs "$@"

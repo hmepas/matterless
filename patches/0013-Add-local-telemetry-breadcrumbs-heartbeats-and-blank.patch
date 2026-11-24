@@ -1,0 +1,826 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Tue, 24 Nov 2026 20:37:32 +0300
+Subject: [PATCH] Add local telemetry, breadcrumbs, heartbeats, and
+ blank-screen watchdog
+
+Embed lightweight client diagnostics that send sanitized stack traces, React component stacks, last 40 breadcrumbs (routes, network/focus, WebSocket transitions, failed/slow fetches), periodic heartbeats, manual Cmd/Ctrl+Shift+Alt+D snapshots, and automatic blank-screen watchdog reports to the local proxy POST /__telemetry endpoint.
+---
+ .../src/client/web_websocket_client.tsx       |  24 +
+ .../src/components/app_error_boundary.tsx     |  15 +-
+ webapp/channels/src/components/root/root.tsx  |  14 +-
+ webapp/channels/src/entry.tsx                 |  32 ++
+ webapp/channels/src/utils/telemetry.test.ts   | 130 ++++++
+ webapp/channels/src/utils/telemetry.ts        | 440 ++++++++++++++++++
+ 6 files changed, 650 insertions(+), 5 deletions(-)
+ create mode 100644 webapp/channels/src/utils/telemetry.test.ts
+ create mode 100644 webapp/channels/src/utils/telemetry.ts
+
+diff --git a/webapp/channels/src/client/web_websocket_client.tsx b/webapp/channels/src/client/web_websocket_client.tsx
+index 46d0b57a..1815c271 100644
+--- a/webapp/channels/src/client/web_websocket_client.tsx
++++ b/webapp/channels/src/client/web_websocket_client.tsx
+@@ -8,6 +8,8 @@
+ 
+ import {WebSocketClient} from '@mattermost/client';
+ 
++import {addBreadcrumb} from 'utils/telemetry';
++
+ const MAX_RETRY_TIME_MS = 15000;
+ const RESUME_DEBOUNCE_MS = 250;
+ const HEALTH_PROBE_TIMEOUT_MS = 5000;
+@@ -36,6 +38,23 @@ export class ResilientWebSocketClient extends WebSocketClient {
+         return this as unknown as WebSocketClientInternals;
+     }
+ 
++    public getConnectionState(): 'open' | 'connecting' | 'closing' | 'closed' | 'none' {
++        const conn = this.internals().conn;
++        if (!conn) {
++            return 'none';
++        }
++        switch (conn.readyState) {
++        case 0:
++            return 'connecting';
++        case 1:
++            return 'open';
++        case 2:
++            return 'closing';
++        default:
++            return 'closed';
++        }
++    }
++
+     public initialize(connectionUrl: string, token?: string, postedAck?: boolean): void {
+         if (connectionUrl) {
+             this.lastConnectionUrl = connectionUrl;
+@@ -48,6 +67,7 @@ export class ResilientWebSocketClient extends WebSocketClient {
+         }
+         this.active = true;
+         this.attachResumeListeners();
++        addBreadcrumb('ws', 'initialize');
+         super.initialize(connectionUrl, token, postedAck);
+     }
+ 
+@@ -55,6 +75,7 @@ export class ResilientWebSocketClient extends WebSocketClient {
+         this.active = false;
+         this.detachResumeListeners();
+         this.clearTimers();
++        addBreadcrumb('ws', 'close_manual');
+         super.close();
+     }
+ 
+@@ -130,15 +151,18 @@ export class ResilientWebSocketClient extends WebSocketClient {
+             if (internals.connectFailCount > 1) {
+                 internals.connectFailCount = 1;
+             }
++            addBreadcrumb('ws', `resume_reconnect fail_count=${internals.connectFailCount}`);
+             super.initialize(this.lastConnectionUrl, this.lastToken, this.lastPostedAck);
+             return;
+         }
+ 
+         if (conn.readyState === openState && !this.probeTimer) {
+             const probedConn = conn;
++            addBreadcrumb('ws', 'probe_start');
+             this.probeTimer = setTimeout(() => {
+                 this.probeTimer = null;
+                 if (this.internals().conn === probedConn && probedConn.readyState === openState) {
++                    addBreadcrumb('ws', 'probe_timeout_closing');
+                     const prevOnClose = probedConn.onclose;
+                     probedConn.onclose = null;
+                     probedConn.close();
+diff --git a/webapp/channels/src/components/app_error_boundary.tsx b/webapp/channels/src/components/app_error_boundary.tsx
+index 9eee6cb5..813c38d8 100644
+--- a/webapp/channels/src/components/app_error_boundary.tsx
++++ b/webapp/channels/src/components/app_error_boundary.tsx
+@@ -7,6 +7,7 @@ import React from 'react';
+ 
+ import {getHistory} from 'utils/browser_history';
+ import {isChunkLoadError, reportClientError, tryReloadOnceForChunkError} from 'utils/crash_recovery';
++import {addBreadcrumb, reportTelemetry} from 'utils/telemetry';
+ 
+ type Props = {
+     children: React.ReactNode;
+@@ -115,10 +116,18 @@ export default class AppErrorBoundary extends React.PureComponent<Props, State>
+         this.unlistenHistory?.();
+     }
+ 
+-    componentDidCatch(error: Error) {
++    componentDidCatch(error: Error, errorInfo?: React.ErrorInfo) {
+         const chunkError = isChunkLoadError(error);
+-        reportClientError(chunkError ? 'chunk_load_error' : 'react_crash', error, {
+-            component: this.props.componentName || 'App',
++        const event = chunkError ? 'chunk_load_error' : 'react_crash';
++        const component = this.props.componentName || 'App';
++        reportClientError(event, error, {
++            component,
++        });
++        addBreadcrumb('react', `${event} in ${component}`);
++        reportTelemetry(event, {
++            error,
++            component,
++            componentStack: errorInfo?.componentStack,
+         });
+ 
+         if (chunkError && tryReloadOnceForChunkError()) {
+diff --git a/webapp/channels/src/components/root/root.tsx b/webapp/channels/src/components/root/root.tsx
+index 86a2c91a..0d6c191d 100644
+--- a/webapp/channels/src/components/root/root.tsx
++++ b/webapp/channels/src/components/root/root.tsx
+@@ -35,6 +35,7 @@ import DesktopApp from 'utils/desktop_api';
+ import {EmojiIndicesByAlias} from 'utils/emoji';
+ import {TEAM_NAME_PATH_PATTERN} from 'utils/path';
+ import {rudderAnalytics, RudderTelemetryHandler} from 'utils/rudder';
++import {addBreadcrumb, reportTelemetry} from 'utils/telemetry';
+ import {getSiteURL} from 'utils/url';
+ import {isAndroidWeb, isChromebook, isDesktopApp, isIosWeb} from 'utils/user_agent';
+ import {applyTheme, isTextDroppableEvent} from 'utils/utils';
+@@ -188,11 +189,15 @@ export default class Root extends React.PureComponent<Props, State> {
+         Promise.all([
+             this.props.actions.initializeProducts(),
+             initializePlugins(),
+-        ]).catch(() => {
++        ]).catch((err) => {
+             // PATCH(all-teams): never let a transient plugin/product load failure leave a white screen.
++            addBreadcrumb('root', 'plugins_init_error');
++            reportTelemetry('plugins_init_error', {error: err, component: 'Root'});
+         }).then(() => {
+             if (!this.isUnmounted) {
++                addBreadcrumb('root', 'routes_mounted', {route: this.props.location.pathname});
+                 this.setState({shouldMountAppRoutes: true});
++                reportTelemetry('heartbeat', {maxBreadcrumbs: 12, deduplicate: false});
+             }
+         });
+ 
+@@ -370,6 +375,7 @@ export default class Root extends React.PureComponent<Props, State> {
+             }
+ 
+             if (isLoaded) {
++                addBreadcrumb('root', `bootstrap_ok me=${Boolean(isMeRequested)}`, {route: this.props.location.pathname});
+                 if (this.state.bootstrapFailed) {
+                     this.setState({bootstrapFailed: false});
+                 }
+@@ -388,12 +394,16 @@ export default class Root extends React.PureComponent<Props, State> {
+             } else {
+                 // PATCH(all-teams): avoid a permanent blank white screen if initial config/me fails
+                 // during a VPN transition; show a recovery banner and auto-retry.
++                addBreadcrumb('root', 'bootstrap_fail', {route: this.props.location.pathname});
++                reportTelemetry('bootstrap_fail', {component: 'Root', route: this.props.location.pathname});
+                 this.setState({bootstrapFailed: true});
+                 InitialLoadingScreen.stop('root');
+                 this.scheduleBootstrapRetry();
+             }
+-        } catch {
++        } catch (err) {
+             if (!this.isUnmounted) {
++                addBreadcrumb('root', 'bootstrap_exception', {route: this.props.location.pathname});
++                reportTelemetry('bootstrap_fail', {error: err, component: 'Root', route: this.props.location.pathname});
+                 this.setState({bootstrapFailed: true});
+                 InitialLoadingScreen.stop('root');
+                 this.scheduleBootstrapRetry();
+diff --git a/webapp/channels/src/entry.tsx b/webapp/channels/src/entry.tsx
+index fea12404..0ab1dca0 100644
+--- a/webapp/channels/src/entry.tsx
++++ b/webapp/channels/src/entry.tsx
+@@ -10,8 +10,11 @@ import store from 'stores/redux_store';
+ 
+ import App from 'components/app';
+ 
++import webSocketClient from 'client/web_websocket_client';
++import {getHistory} from 'utils/browser_history';
+ import {AnnouncementBarTypes} from 'utils/constants';
+ import {reportClientError} from 'utils/crash_recovery';
++import {installTelemetryMonitors, reportTelemetry} from 'utils/telemetry';
+ import {setCSRFFromCookie} from 'utils/utils';
+ 
+ // Import our styles
+@@ -30,12 +33,40 @@ declare global {
+ // This is for anything that needs to be done for ALL react components.
+ // This runs before we start to render anything.
+ function preRenderSetup(onPreRenderSetupReady: () => void) {
++    // PATCH(all-teams): install local mini-Sentry monitors (breadcrumbs, heartbeats, blank-screen watchdog).
++    installTelemetryMonitors({
++        getWsState: () => webSocketClient.getConnectionState(),
++        getStoreSummary: () => {
++            const state = store.getState();
++            const currentUserId = state.entities?.users?.currentUserId;
++            const teams = state.entities?.teams?.teams;
++            const currentChannelId = state.entities?.channels?.currentChannelId;
++            return {
++                has_current_user: Boolean(currentUserId),
++                teams_count: teams ? Object.keys(teams).length : 0,
++                has_channel: Boolean(currentChannelId),
++            };
++        },
++        listenHistory: (listener) => {
++            try {
++                const history = getHistory();
++                if (history && typeof history.listen === 'function') {
++                    return history.listen(listener);
++                }
++            } catch {
++                // Ignore if history is unavailable.
++            }
++            return () => {};
++        },
++    });
++
+     window.onerror = (msg, url, line, column, error) => {
+         if (msg === 'ResizeObserver loop limit exceeded') {
+             return;
+         }
+ 
+         reportClientError('window_error', error ?? msg);
++        reportTelemetry('window_error', {error: error ?? msg});
+ 
+         store.dispatch(
+             logError(
+@@ -56,6 +87,7 @@ function preRenderSetup(onPreRenderSetupReady: () => void) {
+             return;
+         }
+         reportClientError('unhandled_rejection', reason);
++        reportTelemetry('unhandled_rejection', {error: reason});
+     });
+ 
+     setCSRFFromCookie();
+diff --git a/webapp/channels/src/utils/telemetry.test.ts b/webapp/channels/src/utils/telemetry.test.ts
+new file mode 100644
+index 00000000..363e1709
+--- /dev/null
++++ b/webapp/channels/src/utils/telemetry.test.ts
+@@ -0,0 +1,130 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import {
++    addBreadcrumb,
++    getBreadcrumbs,
++    installTelemetryMonitors,
++    reportTelemetry,
++    resetTelemetryForTests,
++} from './telemetry';
++
++describe('utils/telemetry', () => {
++    const originalFetch = window.fetch;
++    let cleanup: (() => void) | null = null;
++
++    beforeEach(() => {
++        jest.useFakeTimers();
++        resetTelemetryForTests();
++        document.body.innerHTML = '<div id="root"></div>';
++        window.history.pushState({}, '', '/team/channels/town-square');
++    });
++
++    afterEach(() => {
++        cleanup?.();
++        cleanup = null;
++        jest.useRealTimers();
++        window.fetch = originalFetch;
++        document.body.innerHTML = '';
++    });
++
++    test('caps breadcrumbs at 40 and strips query strings from routes', () => {
++        for (let i = 0; i < 45; i++) {
++            addBreadcrumb('route', `nav-${i}`, {route: `/team/channels/c${i}?token=secret`});
++        }
++        const crumbs = getBreadcrumbs();
++        expect(crumbs).toHaveLength(40);
++        expect(crumbs[0].msg).toBe('nav-5');
++        expect(crumbs[crumbs.length - 1].route).toBe('/team/channels/c44');
++    });
++
++    test('sends stack frames, component_stack, dom summary, and breadcrumbs to /__telemetry', () => {
++        const fetchMock = jest.fn().mockResolvedValue({ok: true, status: 204});
++        window.fetch = fetchMock as unknown as typeof fetch;
++        document.body.innerHTML = '<div id="root"><div>hello</div></div>';
++
++        addBreadcrumb('ws', 'ws_close code=1006');
++        const err = new Error('boom');
++        err.stack = 'Error: boom\n    at render (http://localhost:9005/static/main.abc.js?secret=1:10:2)';
++
++        reportTelemetry('react_crash', {
++            error: err,
++            component: 'CenterChannel',
++            componentStack: '\n    in CenterChannel\n    in Root',
++            route: '/team/channels/town-square?secret=1',
++        });
++
++        expect(fetchMock).toHaveBeenCalledTimes(1);
++        const [url, init] = fetchMock.mock.calls[0];
++        expect(url).toBe('/__telemetry');
++        const body = JSON.parse(init.body as string);
++        expect(body.event).toBe('react_crash');
++        expect(body.component).toBe('CenterChannel');
++        expect(body.route).toBe('/team/channels/town-square');
++        expect(body.error.name).toBe('Error');
++        expect(body.error.message).toBe('boom');
++        expect(body.error.stack[1]).toBe('at render (http://localhost:9005/static/main.abc.js:10:2)');
++        expect(body.error.component_stack).toEqual(['in CenterChannel', 'in Root']);
++        expect(body.dom).toEqual({root_children: 1, root_text_len: 5, loading_visible: false});
++        expect(body.breadcrumbs[0].msg).toBe('ws_close code=1006');
++    });
++
++    test('blank-screen watchdog fires when #root stays empty and stays quiet when content renders', () => {
++        const fetchMock = jest.fn().mockResolvedValue({ok: true, status: 204});
++        window.fetch = fetchMock as unknown as typeof fetch;
++
++        cleanup = installTelemetryMonitors({
++            getWsState: () => 'closed',
++            getStoreSummary: () => ({has_current_user: true, teams_count: 1, has_channel: false}),
++        });
++
++        jest.advanceTimersByTime(12000);
++
++        const blankCalls = fetchMock.mock.calls.filter(([, init]) => JSON.parse(init.body as string).event === 'blank_screen');
++        expect(blankCalls).toHaveLength(1);
++        const payload = JSON.parse(blankCalls[0][1].body as string);
++        expect(payload.ws_state).toBe('closed');
++        expect(payload.dom).toEqual({
++            root_children: 0,
++            root_text_len: 0,
++            loading_visible: false,
++            has_current_user: true,
++            teams_count: 1,
++            has_channel: false,
++        });
++
++        // Once content renders, focus should not trigger another blank_screen report.
++        document.body.innerHTML = '<div id="root"><div>Loaded channel content</div></div>';
++        jest.advanceTimersByTime(31000);
++        window.dispatchEvent(new Event('focus'));
++        jest.advanceTimersByTime(8000);
++
++        const blankCallsAfter = fetchMock.mock.calls.filter(([, init]) => JSON.parse(init.body as string).event === 'blank_screen');
++        expect(blankCallsAfter).toHaveLength(1);
++    });
++
++    test('wraps fetch to record failed API requests without recursing on /__telemetry', async () => {
++        const fetchMock = jest.fn().mockResolvedValue({ok: false, status: 502});
++        window.fetch = fetchMock as unknown as typeof fetch;
++
++        cleanup = installTelemetryMonitors();
++
++        await window.fetch('/api/v4/users/me?token=secret', {method: 'GET'});
++
++        const httpCrumb = getBreadcrumbs().find((c) => c.cat === 'http');
++        expect(httpCrumb).toBeDefined();
++        expect(httpCrumb?.msg).toBe('GET /api/v4/users/me');
++        expect(httpCrumb?.status).toBe(502);
++    });
++
++    test('manual snapshot hotkey sends manual_snapshot event immediately', () => {
++        const fetchMock = jest.fn().mockResolvedValue({ok: true, status: 204});
++        window.fetch = fetchMock as unknown as typeof fetch;
++
++        cleanup = installTelemetryMonitors();
++        window.dispatchEvent(new KeyboardEvent('keydown', {key: 'd', ctrlKey: true, shiftKey: true, altKey: true}));
++
++        const manualCalls = fetchMock.mock.calls.filter(([, init]) => JSON.parse(init.body as string).event === 'manual_snapshot');
++        expect(manualCalls).toHaveLength(1);
++    });
++});
+diff --git a/webapp/channels/src/utils/telemetry.ts b/webapp/channels/src/utils/telemetry.ts
+new file mode 100644
+index 00000000..34dffd25
+--- /dev/null
++++ b/webapp/channels/src/utils/telemetry.ts
+@@ -0,0 +1,440 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// PATCH(all-teams): lightweight local telemetry ("mini-Sentry") that records safe diagnostic
++// breadcrumbs, stack traces, heartbeats, and blank-screen watchdog snapshots to the local proxy
++// (POST /__telemetry) without ever capturing message bodies, cookies, tokens, or query strings.
++
++export type Breadcrumb = {
++    ts: string;
++    cat: string;
++    msg: string;
++    route?: string;
++    status?: number;
++    ms?: number;
++};
++
++export type TelemetryDomSummary = {
++    root_children?: number;
++    root_text_len?: number;
++    loading_visible?: boolean;
++    has_current_user?: boolean;
++    teams_count?: number;
++    has_channel?: boolean;
++    should_mount_routes?: boolean;
++};
++
++export type TelemetryStoreSummary = Pick<TelemetryDomSummary, 'has_current_user' | 'teams_count' | 'has_channel'>;
++
++export type TelemetryErrorPayload = {
++    name?: string;
++    message?: string;
++    stack?: string[];
++    component_stack?: string[];
++};
++
++export type TelemetryMonitorOptions = {
++    getStoreSummary?: () => TelemetryStoreSummary;
++    getWsState?: () => string;
++    listenHistory?: (listener: (location: {pathname: string}) => void) => () => void;
++};
++
++const MAX_BREADCRUMBS = 40;
++const ERROR_DEDUP_MS = 10000;
++const SLOW_FETCH_MS = 5000;
++const BLANK_SCREEN_BOOT_DELAY_MS = 12000;
++const BLANK_SCREEN_NAV_DELAY_MS = 8000;
++const BLANK_SCREEN_COOLDOWN_MS = 30000;
++const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
++
++const BLANK_SCREEN_IGNORED_PREFIXES = [
++    '/login',
++    '/__auth',
++    '/signup',
++    '/landing',
++    '/error',
++    '/mfa',
++    '/reset_password',
++    '/access_problem',
++];
++
++let tabId = generateTabId();
++let startedAt = Date.now();
++const breadcrumbs: Breadcrumb[] = [];
++const recentEvents = new Map<string, number>();
++let lastBlankScreenReportAt = 0;
++
++let installed = false;
++let nativeFetch: typeof fetch | null = null;
++let storeSummaryGetter: (() => TelemetryStoreSummary) | undefined;
++let wsStateGetter: (() => string) | undefined;
++
++function generateTabId(): string {
++    return Math.random().toString(16).slice(2, 10).padEnd(8, '0');
++}
++
++function sanitizePath(raw: string): string {
++    if (!raw) {
++        return '';
++    }
++    try {
++        if (raw.startsWith('http://') || raw.startsWith('https://')) {
++            return new URL(raw).pathname.slice(0, 160);
++        }
++    } catch {
++        // Fall through to string splitting.
++    }
++    return raw.split(/[?#]/, 1)[0].slice(0, 160);
++}
++
++function sanitizeLine(raw: string, maxLen: number): string {
++    return raw.
++        replace(/[\r\n\t]+/g, ' ').
++        replace(/\?[^\s):\]"']*/g, '').
++        trim().
++        slice(0, maxLen);
++}
++
++function detectBundleId(): string | undefined {
++    if (typeof document === 'undefined') {
++        return undefined;
++    }
++    const script = document.querySelector<HTMLScriptElement>('script[src*="/static/main."]');
++    const src = script?.getAttribute('src');
++    if (!src) {
++        return undefined;
++    }
++    const clean = sanitizePath(src);
++    const parts = clean.split('/');
++    return parts[parts.length - 1] || undefined;
++}
++
++function buildErrorPayload(error: unknown, componentStack?: string): TelemetryErrorPayload | undefined {
++    const payload: TelemetryErrorPayload = {};
++
++    if (error instanceof Error) {
++        payload.name = sanitizeLine(error.name || 'Error', 80);
++        payload.message = sanitizeLine(error.message || '', 240);
++        if (error.stack) {
++            payload.stack = error.stack.
++                split('\n').
++                map((line) => sanitizeLine(line, 200)).
++                filter(Boolean).
++                slice(0, 12);
++        }
++    } else if (error && typeof error === 'object') {
++        const obj = error as {name?: unknown; message?: unknown; server_error_id?: unknown; status_code?: unknown; stack?: unknown};
++        if (obj.name) {
++            payload.name = sanitizeLine(String(obj.name), 80);
++        }
++        const msgParts = [obj.server_error_id, obj.status_code, obj.message].filter((v) => v !== undefined && v !== '');
++        if (msgParts.length > 0) {
++            payload.message = sanitizeLine(msgParts.map(String).join(':'), 240);
++        }
++        if (typeof obj.stack === 'string') {
++            payload.stack = obj.stack.
++                split('\n').
++                map((line) => sanitizeLine(line, 200)).
++                filter(Boolean).
++                slice(0, 12);
++        }
++    } else if (error !== undefined && error !== null && error !== '') {
++        payload.message = sanitizeLine(String(error), 240);
++    }
++
++    if (componentStack) {
++        const frames = componentStack.
++            split('\n').
++            map((line) => sanitizeLine(line, 120)).
++            filter(Boolean).
++            slice(0, 12);
++        if (frames.length > 0) {
++            payload.component_stack = frames;
++        }
++    }
++
++    return Object.keys(payload).length > 0 ? payload : undefined;
++}
++
++export function collectDomSummary(): TelemetryDomSummary {
++    const summary: TelemetryDomSummary = {};
++    if (typeof document !== 'undefined') {
++        const root = document.getElementById('root');
++        summary.root_children = root ? root.children.length : 0;
++        summary.root_text_len = root ? (root.textContent ?? '').trim().length : 0;
++
++        const loadingEl = document.getElementById('initialPageLoadingScreen');
++        summary.loading_visible = Boolean(
++            loadingEl &&
++            !loadingEl.classList.contains('fade-out') &&
++            loadingEl.style.display !== 'none',
++        );
++    }
++    if (storeSummaryGetter) {
++        try {
++            const storeSummary = storeSummaryGetter();
++            if (typeof storeSummary.has_current_user === 'boolean') {
++                summary.has_current_user = storeSummary.has_current_user;
++            }
++            if (typeof storeSummary.teams_count === 'number') {
++                summary.teams_count = storeSummary.teams_count;
++            }
++            if (typeof storeSummary.has_channel === 'boolean') {
++                summary.has_channel = storeSummary.has_channel;
++            }
++        } catch {
++            // Never let diagnostic inspection throw.
++        }
++    }
++    return summary;
++}
++
++export function addBreadcrumb(
++    cat: string,
++    msg: string,
++    extra: {route?: string; status?: number; ms?: number} = {},
++): void {
++    const crumb: Breadcrumb = {
++        ts: new Date().toISOString(),
++        cat: sanitizeLine(cat, 32),
++        msg: sanitizeLine(msg, 140),
++    };
++    if (extra.route) {
++        crumb.route = sanitizePath(extra.route);
++    }
++    if (typeof extra.status === 'number' && Number.isFinite(extra.status)) {
++        crumb.status = Math.round(extra.status);
++    }
++    if (typeof extra.ms === 'number' && Number.isFinite(extra.ms)) {
++        crumb.ms = Math.round(extra.ms);
++    }
++    breadcrumbs.push(crumb);
++    if (breadcrumbs.length > MAX_BREADCRUMBS) {
++        breadcrumbs.shift();
++    }
++}
++
++export function getBreadcrumbs(): Breadcrumb[] {
++    return breadcrumbs.slice();
++}
++
++export function reportTelemetry(
++    event: string,
++    options: {
++        error?: unknown;
++        component?: string;
++        componentStack?: string;
++        route?: string;
++        maxBreadcrumbs?: number;
++        deduplicate?: boolean;
++    } = {},
++): void {
++    const errorPayload = buildErrorPayload(options.error, options.componentStack);
++    const component = options.component ?? '';
++    const route = sanitizePath(options.route ?? (typeof window !== 'undefined' ? window.location.pathname : ''));
++
++    if (options.deduplicate !== false) {
++        const key = `${event}|${component}|${errorPayload?.name ?? ''}|${errorPayload?.message ?? ''}`;
++        const now = Date.now();
++        const prev = recentEvents.get(key);
++        if (prev !== undefined && now - prev < ERROR_DEDUP_MS) {
++            return;
++        }
++        recentEvents.set(key, now);
++    }
++
++    const fetchFn = nativeFetch ?? (typeof fetch === 'function' ? fetch : null);
++    if (!fetchFn) {
++        return;
++    }
++
++    const maxCrumbs = options.maxBreadcrumbs ?? MAX_BREADCRUMBS;
++    const payload = {
++        event,
++        tab_id: tabId,
++        bundle_id: detectBundleId(),
++        route,
++        component: component || undefined,
++        online: typeof navigator !== 'undefined' ? navigator.onLine : true,
++        visibility: typeof document !== 'undefined' ? document.visibilityState : undefined,
++        ws_state: wsStateGetter ? wsStateGetter() : undefined,
++        uptime_s: Math.max(0, Math.round((Date.now() - startedAt) / 1000)),
++        error: errorPayload,
++        dom: collectDomSummary(),
++        breadcrumbs: maxCrumbs > 0 ? breadcrumbs.slice(-maxCrumbs) : undefined,
++    };
++
++    try {
++        fetchFn('/__telemetry', {
++            method: 'POST',
++            headers: {'Content-Type': 'application/json'},
++            keepalive: true,
++            body: JSON.stringify(payload),
++        }).catch(() => {
++            // Telemetry must never break the application.
++        });
++    } catch {
++        // Ignore synchronous fetch mock errors.
++    }
++}
++
++function isIgnoredBlankScreenRoute(pathname: string): boolean {
++    return BLANK_SCREEN_IGNORED_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
++}
++
++export function installTelemetryMonitors(options: TelemetryMonitorOptions = {}): () => void {
++    storeSummaryGetter = options.getStoreSummary;
++    wsStateGetter = options.getWsState;
++
++    if (installed || typeof window === 'undefined') {
++        return () => {};
++    }
++    installed = true;
++
++    let blankScreenTimer: ReturnType<typeof setTimeout> | null = null;
++
++    const checkBlankScreen = () => {
++        blankScreenTimer = null;
++        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
++            return;
++        }
++        const pathname = sanitizePath(window.location.pathname);
++        if (isIgnoredBlankScreenRoute(pathname)) {
++            return;
++        }
++        const dom = collectDomSummary();
++        const looksBlank = (dom.root_text_len === 0 && !dom.loading_visible) || Boolean(dom.loading_visible);
++        if (!looksBlank) {
++            return;
++        }
++        const now = Date.now();
++        if (now - lastBlankScreenReportAt < BLANK_SCREEN_COOLDOWN_MS) {
++            return;
++        }
++        lastBlankScreenReportAt = now;
++        addBreadcrumb('watchdog', `blank_screen text_len=${dom.root_text_len ?? 0} loading=${Boolean(dom.loading_visible)}`);
++        reportTelemetry('blank_screen', {deduplicate: false});
++    };
++
++    const scheduleBlankScreenCheck = (delayMs: number) => {
++        if (blankScreenTimer) {
++            clearTimeout(blankScreenTimer);
++        }
++        blankScreenTimer = setTimeout(checkBlankScreen, delayMs);
++    };
++
++    const onOnline = () => {
++        addBreadcrumb('net', 'online');
++        scheduleBlankScreenCheck(BLANK_SCREEN_NAV_DELAY_MS);
++        reportTelemetry('heartbeat', {maxBreadcrumbs: 12, deduplicate: false});
++    };
++
++    const onOffline = () => {
++        addBreadcrumb('net', 'offline');
++        reportTelemetry('heartbeat', {maxBreadcrumbs: 12, deduplicate: false});
++    };
++
++    const onFocus = () => {
++        addBreadcrumb('ui', 'focus');
++        scheduleBlankScreenCheck(BLANK_SCREEN_NAV_DELAY_MS);
++    };
++
++    const onVisibilityChange = () => {
++        const state = typeof document !== 'undefined' ? document.visibilityState : 'unknown';
++        addBreadcrumb('ui', `visibility:${state}`);
++        if (state === 'visible') {
++            scheduleBlankScreenCheck(BLANK_SCREEN_NAV_DELAY_MS);
++        }
++    };
++
++    const onKeyDown = (event: KeyboardEvent) => {
++        if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.altKey && event.key.toLowerCase() === 'd') {
++            addBreadcrumb('ui', 'manual_snapshot');
++            reportTelemetry('manual_snapshot', {deduplicate: false});
++        }
++    };
++
++    window.addEventListener('online', onOnline);
++    window.addEventListener('offline', onOffline);
++    window.addEventListener('focus', onFocus);
++    window.addEventListener('keydown', onKeyDown);
++    if (typeof document !== 'undefined') {
++        document.addEventListener('visibilitychange', onVisibilityChange);
++    }
++
++    const unlistenHistory = options.listenHistory?.((location) => {
++        const route = sanitizePath(location.pathname);
++        addBreadcrumb('route', route, {route});
++        scheduleBlankScreenCheck(BLANK_SCREEN_NAV_DELAY_MS);
++    });
++
++    const originalFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
++    if (originalFetch) {
++        nativeFetch = originalFetch;
++        window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
++            const rawUrl = typeof input === 'string' ? input : (input instanceof URL ? input.toString() : input.url);
++            const pathname = sanitizePath(rawUrl);
++            if (pathname === '/__telemetry' || pathname === '/__client_log') {
++                return originalFetch(input, init);
++            }
++            const method = (init?.method || (typeof input !== 'string' && !(input instanceof URL) ? input.method : 'GET') || 'GET').toUpperCase();
++            const reqStarted = Date.now();
++            return originalFetch(input, init).then(
++                (response) => {
++                    const ms = Date.now() - reqStarted;
++                    if (!response.ok || ms >= SLOW_FETCH_MS) {
++                        addBreadcrumb('http', `${method} ${pathname}`, {status: response.status, ms});
++                    }
++                    return response;
++                },
++                (err) => {
++                    const ms = Date.now() - reqStarted;
++                    addBreadcrumb('http', `${method} ${pathname} network_error`, {status: 0, ms});
++                    throw err;
++                },
++            );
++        }) as typeof fetch;
++    }
++
++    const heartbeatTimer = setInterval(() => {
++        if (typeof document === 'undefined' || document.visibilityState === 'visible') {
++            reportTelemetry('heartbeat', {maxBreadcrumbs: 10, deduplicate: false});
++        }
++    }, HEARTBEAT_INTERVAL_MS);
++
++    addBreadcrumb('app', 'telemetry_installed', {route: window.location.pathname});
++    scheduleBlankScreenCheck(BLANK_SCREEN_BOOT_DELAY_MS);
++
++    return () => {
++        installed = false;
++        if (blankScreenTimer) {
++            clearTimeout(blankScreenTimer);
++            blankScreenTimer = null;
++        }
++        clearInterval(heartbeatTimer);
++        window.removeEventListener('online', onOnline);
++        window.removeEventListener('offline', onOffline);
++        window.removeEventListener('focus', onFocus);
++        window.removeEventListener('keydown', onKeyDown);
++        if (typeof document !== 'undefined') {
++            document.removeEventListener('visibilitychange', onVisibilityChange);
++        }
++        unlistenHistory?.();
++        if (originalFetch) {
++            window.fetch = originalFetch;
++            nativeFetch = null;
++        }
++    };
++}
++
++export function resetTelemetryForTests(): void {
++    breadcrumbs.length = 0;
++    recentEvents.clear();
++    lastBlankScreenReportAt = 0;
++    tabId = generateTabId();
++    startedAt = Date.now();
++    installed = false;
++    nativeFetch = null;
++    storeSummaryGetter = undefined;
++    wsStateGetter = undefined;
++}

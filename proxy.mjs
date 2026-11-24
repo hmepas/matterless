@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import zlib from 'node:zlib';
 
 const {
@@ -15,13 +16,25 @@ const {
     MM_ALL_TEAMS_LAYOUT_FILE: layoutFile,
     MM_SESSION_FILE: sessionFileEnv,
     MM_PROXY_LOG: logEnv,
+    MM_PROXY_LOG_STDOUT: logStdoutEnv,
+    MM_TELEMETRY_LOG: telemetryLogEnv,
     MM_PROXY_POST_TIMEOUT_MS: postTimeoutEnv,
+    MM_PROXY_GET_TIMEOUT_MS: getTimeoutEnv,
     MM_PROXY_PING_TIMEOUT_MS: pingTimeoutEnv,
     MM_PROXY_SSO_PROVIDERS: ssoProvidersEnv,
     MM_SESSION_TOKEN: sessionToken,
     MM_SESSION_USERID: sessionUserId,
     MM_SESSION_CSRF: sessionCsrf,
 } = process.env;
+
+let logToStdout = logStdoutEnv === '1' || logStdoutEnv === 'true';
+for (const arg of process.argv.slice(2)) {
+    if (arg === '--stdout') {
+        logToStdout = true;
+    } else if (arg === '--no-stdout' || arg === '--quiet') {
+        logToStdout = false;
+    }
+}
 
 if (!siteUrl) {
     console.error('set MM_SERVICESETTINGS_SITEURL=https://your-mattermost-host');
@@ -68,14 +81,19 @@ const CONTENT_TYPES = {
 };
 
 const CLIENT_LOG_FIELDS = ['event', 'pending_post_id', 'channel_id', 'root_id', 'status_code', 'server_error_id', 'online', 'ws', 'component', 'error', 'route'];
+const TELEMETRY_DOM_FIELDS = ['root_children', 'root_text_len', 'loading_visible', 'has_current_user', 'teams_count', 'has_channel', 'should_mount_routes'];
+const ASSET_EXTS = new Set([...Object.keys(CONTENT_TYPES), '.txt', '.xml', '.webmanifest', '.pdf', '.mjs', '.cjs']);
 const HASHED_ASSET = /\.[0-9a-f]{16,}\./;
 const POST_BODY_LOG_FIELDS = ['pending_post_id', 'channel_id', 'root_id'];
 const MAX_LOGGED_BODY_BYTES = 1024 * 1024;
 const MAX_LOG_BYTES = 10 * 1024 * 1024;
+const MAX_TELEMETRY_BODY_BYTES = 64 * 1024;
+const MAX_RECENT_UPSTREAM_ERRORS = 10;
 
 // A post that gets no answer has to end up as failed in the UI, not as pending forever. Resending is
 // safe: the server recognizes a repeated pending_post_id.
 const postTimeoutMs = Number(postTimeoutEnv) || 30000;
+const getTimeoutMs = Number(getTimeoutEnv) || 30000;
 const pingTimeoutMs = Number(pingTimeoutEnv) || 5000;
 const sessionFile = sessionFileEnv ? path.resolve(sessionFileEnv) : '';
 let tmpCounter = 0;
@@ -111,11 +129,81 @@ try {
     // No log yet.
 }
 
+const telemetryFile = path.resolve(telemetryLogEnv || path.join(path.dirname(logFile), 'telemetry.jsonl'));
+let telemetrySize = 0;
+try {
+    telemetrySize = fs.statSync(telemetryFile).size;
+} catch {
+    // No telemetry log yet.
+}
+
+const proxyStartedAt = Date.now();
+const proxyFilePath = fileURLToPath(import.meta.url);
+let proxyFileMtimeMs = 0;
+try {
+    proxyFileMtimeMs = fs.statSync(proxyFilePath).mtimeMs;
+} catch {
+    // Ignore if unavailable.
+}
+let activeWsCount = 0;
+const recentUpstreamErrors = [];
+
+function readCurrentBuild() {
+    try {
+        return fs.readFileSync(path.join(distDir, 'BUILD'), 'utf8').trim() || 'unknown build';
+    } catch {
+        return 'unknown build';
+    }
+}
+
+function isProxyStale() {
+    if (!proxyFileMtimeMs) {
+        return false;
+    }
+    try {
+        return fs.statSync(proxyFilePath).mtimeMs !== proxyFileMtimeMs;
+    } catch {
+        return false;
+    }
+}
+
+function recordUpstreamError(entry) {
+    recentUpstreamErrors.push({ts: new Date().toISOString(), ...entry});
+    if (recentUpstreamErrors.length > MAX_RECENT_UPSTREAM_ERRORS) {
+        recentUpstreamErrors.shift();
+    }
+}
+
+function countAgentSockets(socketMap) {
+    let total = 0;
+    for (const sockets of Object.values(socketMap ?? {})) {
+        if (Array.isArray(sockets)) {
+            total += sockets.length;
+        }
+    }
+    return total;
+}
+
+function proxySnapshot() {
+    return {
+        pid: process.pid,
+        uptime_s: Math.round((Date.now() - proxyStartedAt) / 1000),
+        stale: isProxyStale(),
+        dist_build: readCurrentBuild(),
+        ws_open: activeWsCount,
+        keepalive_free: countAgentSockets(keepAliveAgent.freeSockets),
+        keepalive_active: countAgentSockets(keepAliveAgent.sockets),
+        recent_upstream_errors: recentUpstreamErrors.slice(-MAX_RECENT_UPSTREAM_ERRORS),
+    };
+}
+
 // For sending the file to someone, so it holds ids and statuses only: never a message text, a cookie
 // or a token. Everything logged from a request has to pass through logValue().
 function log(line) {
     const text = `${new Date().toISOString()} ${line}\n`;
-    console.log(text.trimEnd());
+    if (logToStdout) {
+        console.log(text.trimEnd());
+    }
     try {
         if (logSize + text.length > MAX_LOG_BYTES) {
             fs.renameSync(logFile, logFile.replace(/\.log$/, '.old.log'));
@@ -128,12 +216,58 @@ function log(line) {
     }
 }
 
+function writeTelemetry(record) {
+    const line = `${JSON.stringify(record)}\n`;
+    try {
+        if (telemetrySize + line.length > MAX_LOG_BYTES) {
+            const rotated = telemetryFile.endsWith('.jsonl')
+                ? telemetryFile.replace(/\.jsonl$/, '.old.jsonl')
+                : `${telemetryFile}.old`;
+            fs.renameSync(telemetryFile, rotated);
+            telemetrySize = 0;
+        }
+        fs.appendFileSync(telemetryFile, line, {mode: 0o600});
+        telemetrySize += line.length;
+    } catch (error) {
+        console.error(`can't write ${telemetryFile}: ${error.message}`);
+    }
+}
+
 function logValue(value) {
     return String(value).replace(/[^\w:./-]+/g, '_').slice(0, 200);
 }
 
+function sanitizeText(value, maxLen = 180) {
+    return String(value)
+        .replace(/[\r\n\t]+/g, ' ')
+        .replace(/\?[^\s):\]"']*/g, '')
+        .trim()
+        .slice(0, maxLen);
+}
+
+function sanitizeRoute(value) {
+    if (typeof value !== 'string' || !value.trim()) {
+        return '';
+    }
+    const pathname = value.split(/[?#]/, 1)[0];
+    return logValue(pathname).slice(0, 160);
+}
+
 const transport = target.protocol === 'https:' ? https : http;
 const keepAliveAgent = new transport.Agent({keepAlive: true});
+
+// Flush idle keep-alive sockets after upstream transport failures (e.g. VPN drop/reconnect)
+// so subsequent requests don't pick half-open sockets bound to a dead tunnel.
+function resetKeepAlivePool() {
+    for (const sockets of Object.values(keepAliveAgent.freeSockets)) {
+        if (!Array.isArray(sockets)) {
+            continue;
+        }
+        for (const socket of sockets) {
+            socket.destroy();
+        }
+    }
+}
 
 function cookieFromHeader(header, name) {
     const match = new RegExp(`(?:^|;\\s*)${name}=([^;]*)`).exec(header ?? '');
@@ -320,6 +454,15 @@ function startAudit(req, res) {
         if (postBody) {
             fields.push(...postLogFields(postBody));
         }
+        if (audit.upstreamError || status >= 500) {
+            recordUpstreamError({
+                method: req.method,
+                path: logValue(pathOf(req)),
+                status: status || 0,
+                upstream: audit.upstreamError ? logValue(audit.upstreamError) : undefined,
+                ms: Date.now() - started,
+            });
+        }
         log(`${req.method} ${logValue(pathOf(req))} ${fields.join(' ')}`);
     });
     return audit;
@@ -421,6 +564,8 @@ function proxyRequest(req, res, audit = startAudit(req, res), isRetry = false) {
 
     if (isPostCreate(req)) {
         upstream.setTimeout(postTimeoutMs, () => upstream.destroy(Object.assign(new Error('timeout'), {code: 'ETIMEDOUT'})));
+    } else if (isBodiless) {
+        upstream.setTimeout(getTimeoutMs, () => upstream.destroy(Object.assign(new Error('timeout'), {code: 'ETIMEDOUT'})));
     }
 
     upstream.on('response', (upstreamResponse) => {
@@ -454,10 +599,12 @@ function proxyRequest(req, res, audit = startAudit(req, res), isRetry = false) {
 
     upstream.on('error', (error) => {
         res.off('close', abortUpstream);
+        resetKeepAlivePool();
         if (res.destroyed) {
             return;
         }
-        if (isBodiless && !isRetry && !res.headersSent && (error.code === 'ECONNRESET' || error.code === 'EPIPE')) {
+        const retryableReusedTimeout = error.code === 'ETIMEDOUT' && upstream.reusedSocket;
+        if (isBodiless && !isRetry && !res.headersSent && (error.code === 'ECONNRESET' || error.code === 'EPIPE' || retryableReusedTimeout)) {
             proxyRequest(req, res, audit, true);
             return;
         }
@@ -476,9 +623,15 @@ function proxyRequest(req, res, audit = startAudit(req, res), isRetry = false) {
     }
 }
 
-function proxyUpgrade(req, socket, head) {
-    const refuse = (status) => socket.end(`HTTP/1.1 ${status}\r\n\r\n`);
-    socket.on('error', () => socket.destroy());
+function proxyUpgrade(req, socket, head, isRetry = false) {
+    const refuse = (status) => {
+        if (!socket.destroyed) {
+            socket.end(`HTTP/1.1 ${status}\r\n\r\n`);
+        }
+    };
+    if (!isRetry) {
+        socket.on('error', () => socket.destroy());
+    }
 
     if (req.headers.host !== ownHost || !isOwnOrigin(req) || !isProxied(pathOf(req))) {
         refuse('403 Forbidden');
@@ -486,7 +639,11 @@ function proxyUpgrade(req, socket, head) {
     }
 
     const upstream = transport.request(upstreamOptions(req, upstreamHeaders(req), false));
+    upstream.setTimeout(Math.max(pingTimeoutMs, 10000), () => {
+        upstream.destroy(Object.assign(new Error('timeout'), {code: 'ETIMEDOUT'}));
+    });
     upstream.on('upgrade', (upstreamResponse, upstreamSocket, upstreamHead) => {
+        upstream.setTimeout(0);
         const opened = Date.now();
         let closedBy = '';
         const markClosedBy = (who) => {
@@ -495,9 +652,11 @@ function proxyUpgrade(req, socket, head) {
             }
         };
         log(`ws open status=${upstreamResponse.statusCode}`);
+        activeWsCount += 1;
         socket.once('end', () => markClosedBy('client'));
         upstreamSocket.once('end', () => markClosedBy('upstream'));
         socket.once('close', () => {
+            activeWsCount = Math.max(0, activeWsCount - 1);
             markClosedBy('client');
             log(`ws close after_s=${Math.round((Date.now() - opened) / 1000)} by=${closedBy}`);
         });
@@ -527,13 +686,27 @@ function proxyUpgrade(req, socket, head) {
         socket.pipe(upstreamSocket).pipe(socket);
     });
     upstream.on('response', (upstreamResponse) => {
+        upstream.setTimeout(0);
         upstreamResponse.resume();
+        if (upstreamResponse.statusCode >= 500) {
+            recordUpstreamError({method: 'WS', path: logValue(pathOf(req)), status: upstreamResponse.statusCode});
+        }
         log(`ws refused status=${upstreamResponse.statusCode}`);
         refuse(`${upstreamResponse.statusCode} ${upstreamResponse.statusMessage}`);
     });
     upstream.on('error', (error) => {
+        resetKeepAlivePool();
+        if (!isRetry && !socket.destroyed && (error.code === 'ECONNRESET' || error.code === 'EPIPE')) {
+            setTimeout(() => {
+                if (!socket.destroyed) {
+                    proxyUpgrade(req, socket, head, true);
+                }
+            }, 250).unref();
+            return;
+        }
+        recordUpstreamError({method: 'WS', path: logValue(pathOf(req)), status: error.code === 'ETIMEDOUT' ? 504 : 502, upstream: logValue(error.code ?? error.message)});
         log(`ws upstream=${logValue(error.code ?? error.message)}`);
-        refuse('502 Bad Gateway');
+        refuse(error.code === 'ETIMEDOUT' ? '504 Gateway Timeout' : '502 Bad Gateway');
     });
     upstream.end();
 }
@@ -634,7 +807,9 @@ function checkUpstream(callback, isRetry = false) {
         done(upstreamResponse.statusCode >= 500 ? `HTTP_${upstreamResponse.statusCode}` : null);
     });
     probe.on('error', (error) => {
-        if (!isRetry && (error.code === 'ECONNRESET' || error.code === 'EPIPE')) {
+        resetKeepAlivePool();
+        const retryableReusedTimeout = error.code === 'ETIMEDOUT' && probe.reusedSocket;
+        if (!isRetry && (error.code === 'ECONNRESET' || error.code === 'EPIPE' || retryableReusedTimeout)) {
             checkUpstream(callback, true);
             return;
         }
@@ -662,6 +837,7 @@ function servePage(req, res) {
             return;
         }
         if (downReason) {
+            recordUpstreamError({method: 'PING', path: '/api/v4/system/ping', status: 502, upstream: logValue(downReason)});
             log(`page upstream=${logValue(downReason)}`);
             res.writeHead(502, {
                 'Content-Type': 'text/html; charset=utf-8',
@@ -671,6 +847,7 @@ function servePage(req, res) {
             res.end(req.method === 'HEAD' ? undefined : renderUpstreamDownPage(downReason));
             return;
         }
+        log(`page served path=${logValue(pathOf(req))} build=${logValue(readCurrentBuild())}${isProxyStale() ? ' proxy_stale=true' : ''}`);
         const extraHeaders = {};
         if (activeSession) {
             if (cookieFromHeader(req.headers.cookie, 'MMAUTHTOKEN') !== activeSession.MMAUTHTOKEN) {
@@ -681,17 +858,17 @@ function servePage(req, res) {
     });
 }
 
-function readBody(req, onBody, res) {
+function readBody(req, onBody, res, maxBytes = MAX_BODY_BYTES) {
     const chunks = [];
     let size = 0;
     req.on('data', (chunk) => {
         size += chunk.length;
-        if (size <= MAX_BODY_BYTES) {
+        if (size <= maxBytes) {
             chunks.push(chunk);
         }
     });
     req.on('end', () => {
-        if (size > MAX_BODY_BYTES) {
+        if (size > maxBytes) {
             res.writeHead(413).end();
         } else {
             onBody(Buffer.concat(chunks).toString('utf8'));
@@ -767,6 +944,179 @@ function serveClientLog(req, res) {
         log(`client ${fields.join(' ')}`);
         res.writeHead(204).end();
     }, res);
+}
+
+function sanitizeTelemetryError(rawError) {
+    if (!rawError || typeof rawError !== 'object') {
+        return undefined;
+    }
+    const clean = {};
+    if (rawError.name) {
+        clean.name = sanitizeText(rawError.name, 80);
+    }
+    if (rawError.message) {
+        clean.message = sanitizeText(rawError.message, 240);
+    }
+    if (Array.isArray(rawError.stack)) {
+        clean.stack = rawError.stack.slice(0, 12).map((line) => sanitizeText(line, 200)).filter(Boolean);
+    }
+    if (Array.isArray(rawError.component_stack)) {
+        clean.component_stack = rawError.component_stack.slice(0, 12).map((line) => sanitizeText(line, 120)).filter(Boolean);
+    }
+    return Object.keys(clean).length > 0 ? clean : undefined;
+}
+
+function sanitizeTelemetryDom(rawDom) {
+    if (!rawDom || typeof rawDom !== 'object') {
+        return undefined;
+    }
+    const clean = {};
+    for (const key of TELEMETRY_DOM_FIELDS) {
+        const val = rawDom[key];
+        if (typeof val === 'boolean') {
+            clean[key] = val;
+        } else if (typeof val === 'number' && Number.isFinite(val)) {
+            clean[key] = Math.round(val);
+        }
+    }
+    return Object.keys(clean).length > 0 ? clean : undefined;
+}
+
+function sanitizeTelemetryBreadcrumbs(rawBreadcrumbs) {
+    if (!Array.isArray(rawBreadcrumbs)) {
+        return undefined;
+    }
+    const items = [];
+    for (const crumb of rawBreadcrumbs.slice(-40)) {
+        if (!crumb || typeof crumb !== 'object') {
+            continue;
+        }
+        const clean = {};
+        if (typeof crumb.ts === 'string' && crumb.ts) {
+            clean.ts = sanitizeText(crumb.ts, 32);
+        }
+        if (crumb.cat) {
+            clean.cat = logValue(crumb.cat).slice(0, 32);
+        }
+        if (crumb.msg) {
+            clean.msg = sanitizeText(crumb.msg, 140);
+        }
+        const route = sanitizeRoute(crumb.route);
+        if (route) {
+            clean.route = route;
+        }
+        if (typeof crumb.status === 'number' && Number.isFinite(crumb.status)) {
+            clean.status = Math.round(crumb.status);
+        }
+        if (typeof crumb.ms === 'number' && Number.isFinite(crumb.ms)) {
+            clean.ms = Math.round(crumb.ms);
+        }
+        if (Object.keys(clean).length > 0) {
+            items.push(clean);
+        }
+    }
+    return items.length > 0 ? items : undefined;
+}
+
+function sanitizeTelemetryReport(raw) {
+    if (!raw || typeof raw !== 'object' || typeof raw.event !== 'string' || !raw.event.trim()) {
+        return null;
+    }
+    const record = {
+        ts: new Date().toISOString(),
+        event: logValue(raw.event).slice(0, 64),
+    };
+    if (raw.tab_id) {
+        record.tab_id = logValue(raw.tab_id).slice(0, 32);
+    }
+    if (raw.bundle_id) {
+        record.bundle_id = logValue(raw.bundle_id).slice(0, 80);
+    }
+    const route = sanitizeRoute(raw.route);
+    if (route) {
+        record.route = route;
+    }
+    if (raw.component) {
+        record.component = logValue(raw.component).slice(0, 80);
+    }
+    if (typeof raw.online === 'boolean') {
+        record.online = raw.online;
+    }
+    if (raw.visibility) {
+        record.visibility = logValue(raw.visibility).slice(0, 16);
+    }
+    if (raw.ws_state) {
+        record.ws_state = logValue(raw.ws_state).slice(0, 16);
+    }
+    if (typeof raw.uptime_s === 'number' && Number.isFinite(raw.uptime_s) && raw.uptime_s >= 0) {
+        record.uptime_s = Math.round(raw.uptime_s);
+    }
+    const error = sanitizeTelemetryError(raw.error);
+    if (error) {
+        record.error = error;
+    }
+    const dom = sanitizeTelemetryDom(raw.dom);
+    if (dom) {
+        record.dom = dom;
+    }
+    const breadcrumbs = sanitizeTelemetryBreadcrumbs(raw.breadcrumbs);
+    if (breadcrumbs) {
+        record.breadcrumbs = breadcrumbs;
+    }
+    record.proxy = proxySnapshot();
+    return record;
+}
+
+// Structured mini-Sentry endpoint: stores sanitized stacks, breadcrumbs, heartbeats, and
+// blank-screen snapshots in telemetry.jsonl plus a concise pointer line in proxy.log.
+function serveTelemetry(req, res) {
+    if (req.method !== 'POST') {
+        res.writeHead(405).end();
+        return;
+    }
+    if (!isOwnOrigin(req) || !(req.headers['content-type'] ?? '').startsWith('application/json')) {
+        res.writeHead(403).end();
+        return;
+    }
+    readBody(req, (body) => {
+        let parsed;
+        try {
+            parsed = JSON.parse(body);
+        } catch {
+            res.writeHead(400).end();
+            return;
+        }
+        const record = sanitizeTelemetryReport(parsed);
+        if (!record) {
+            res.writeHead(400).end();
+            return;
+        }
+        writeTelemetry(record);
+        const summary = [`event=${record.event}`];
+        if (record.tab_id) {
+            summary.push(`tab=${record.tab_id}`);
+        }
+        if (record.bundle_id) {
+            summary.push(`bundle=${record.bundle_id}`);
+        }
+        if (record.route) {
+            summary.push(`route=${record.route}`);
+        }
+        if (record.ws_state) {
+            summary.push(`ws=${record.ws_state}`);
+        }
+        if (typeof record.online === 'boolean') {
+            summary.push(`online=${record.online}`);
+        }
+        if (record.component) {
+            summary.push(`component=${record.component}`);
+        }
+        if (record.error?.name || record.error?.message) {
+            summary.push(`error=${logValue([record.error.name, record.error.message].filter(Boolean).join(':'))}`);
+        }
+        log(`telemetry ${summary.join(' ')}`);
+        res.writeHead(204).end();
+    }, res, MAX_TELEMETRY_BODY_BYTES);
 }
 
 function extractDesktopServerToken(raw) {
@@ -959,15 +1309,25 @@ function serveAuthDesktop(req, res) {
     }, res);
 }
 
+function isAssetPath(pathname) {
+    const base = path.basename(pathname);
+    if (!base || base.startsWith('@')) {
+        return false;
+    }
+    return ASSET_EXTS.has(path.extname(base).toLowerCase());
+}
+
 const server = http.createServer((req, res) => {
     // A site whose hostname is rebound to 127.0.0.1 would otherwise get the session cookies and the
     // proxy to the real server.
     if (req.headers.host !== ownHost) {
+        log(`refused host=${logValue(req.headers.host ?? 'none')} ${req.method} ${logValue(pathOf(req))} status=403`);
         res.writeHead(403).end();
         return;
     }
 
     const pathname = pathOf(req);
+    const accept = req.headers.accept ?? '';
     if (pathname === '/__auth') {
         serveAuth(req, res);
     } else if (pathname === '/__auth/desktop') {
@@ -976,15 +1336,29 @@ const server = http.createServer((req, res) => {
         serveLayout(req, res);
     } else if (pathname === '/__client_log') {
         serveClientLog(req, res);
+    } else if (pathname === '/__telemetry') {
+        serveTelemetry(req, res);
     } else if (isProxied(pathname)) {
         proxyRequest(req, res);
     } else if (req.method !== 'GET' && req.method !== 'HEAD') {
+        log(`unhandled ${req.method} ${logValue(pathname)} status=405`);
         res.writeHead(405).end();
     } else if (pathname.startsWith('/static/')) {
         serveStatic(req, res, pathname);
-    } else if ((req.headers.accept ?? '').includes('text/html') && !path.basename(pathname).includes('.')) {
+    } else if (accept.includes('text/html') && !isAssetPath(pathname)) {
         servePage(req, res);
     } else {
+        if (pathname !== '/favicon.ico') {
+            log(`unhandled ${req.method} ${logValue(pathname)} accept=${logValue(accept.slice(0, 60) || 'none')} status=404`);
+            if (accept.includes('text/html')) {
+                writeTelemetry({
+                    ts: new Date().toISOString(),
+                    event: 'page_404',
+                    route: sanitizeRoute(pathname),
+                    proxy: proxySnapshot(),
+                });
+            }
+        }
         res.writeHead(404).end();
     }
 });
@@ -1002,11 +1376,12 @@ server.on('error', (error) => {
 
 // Loopback only: this process holds a live session to the real server.
 server.listen(port, 'localhost', () => {
-    let build = 'unknown build';
-    try {
-        build = fs.readFileSync(path.join(distDir, 'BUILD'), 'utf8').trim();
-    } catch {
-        // Built by hand.
-    }
+    const build = readCurrentBuild();
+    log(`proxy start pid=${process.pid} port=${port} node=${process.version} build=${logValue(build)}`);
+    writeTelemetry({
+        ts: new Date().toISOString(),
+        event: 'proxy_start',
+        proxy: proxySnapshot(),
+    });
     console.log(`${ownOrigin} -> ${target.origin} (${build})`);
 });
