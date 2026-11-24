@@ -1,6 +1,8 @@
 # Agent instructions
 
-This repo wraps an upstream Mattermost webapp with a numbered patch series and a zero-dependency Node proxy. Follow these rules before editing, building, or running tests.
+**Principle:** matterless is a local proxy in front of a remote Mattermost server that serves a patched upstream webapp built from `patches/`.
+
+Read [README.md](./README.md) first for the project overview, features, architecture, and environment variables, then follow the rules and workflows below.
 
 ## Hard rules
 

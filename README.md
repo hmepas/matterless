@@ -1,6 +1,8 @@
 # matterless
 
-Run your own patched Mattermost webapp locally in front of any remote Mattermost server. You keep the server's data, auth, and plugins untouched, and load your UI patches in a browser or in Mattermost Desktop at `http://localhost:9005`.
+A local proxy in front of any Mattermost server that serves a patched upstream webapp. Your server's data, auth, and plugins stay untouched, while your browser or Mattermost Desktop loads the patched UI from `http://localhost:9005`.
+
+> Using a coding agent? You can skip reading the rest of this page. Give your agent the URL to [`AGENTS.md`](https://github.com/hmepas/matterless/blob/main/AGENTS.md) and tell it to set up matterless or add a feature.
 
 ## What the patch series adds
 
