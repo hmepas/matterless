@@ -24,6 +24,9 @@ dist.*/
 # Upstream Mattermost clone with the patch: a separate git repo
 src/
 
+# Private patches for one specific server, exported from public..all-teams in src/
+patches.local/
+
 # ALL-mode categories and order: never let a checkout of an old commit overwrite them
 all-teams-layout.json
 

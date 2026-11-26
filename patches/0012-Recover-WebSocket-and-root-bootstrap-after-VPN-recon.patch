@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 24 Nov 2026 20:12:22 +0300
-Subject: [PATCH] Recover WebSocket and root bootstrap after VPN reconnect
+Subject: [PATCH 12/14] Recover WebSocket and root bootstrap after VPN
+ reconnect
 
 Cap WebSocket reconnect backoff at 15s, retry promptly on focus/online/visibilitychange, and probe apparently open sockets on resume so half-open connections close within 5s. Also treat transient 5xx/network failures during initial config/me/teams bootstrap as retryable instead of logging out or sticking on a blank Root div.
 ---

@@ -22,14 +22,30 @@ NEW_BASE=$(git -C src rev-parse FETCH_HEAD)
 [ "$NEW_BASE" != "$OLD_BASE" ] || { echo "already on the latest $UPSTREAM_BRANCH"; exit 0; }
 
 git -C src branch -f pre-update all-teams
-if ! git -C src rebase --onto "$NEW_BASE" "$OLD_BASE" all-teams; then
+# With a `public` branch, move it first and then the private layer on top of it (see build.sh).
+if git -C src show-ref -q --verify refs/heads/public; then
+    git -C src merge-base --is-ancestor public all-teams || { echo "all-teams is not based on public" >&2; exit 1; }
+    git -C src branch -f pre-update-public public
+    if ! git -C src rebase --onto "$NEW_BASE" "$OLD_BASE" public; then
+        git -C src rebase --abort
+        echo "the public patches conflict with $UPSTREAM_BRANCH: nothing changed, resolve it by hand" >&2
+        exit 1
+    fi
+    if ! git -C src rebase --onto public pre-update-public all-teams; then
+        git -C src rebase --abort
+        git -C src branch -f public pre-update-public
+        git -C src checkout -q all-teams
+        echo "the private patches conflict with $UPSTREAM_BRANCH: nothing changed, resolve it by hand" >&2
+        exit 1
+    fi
+elif ! git -C src rebase --onto "$NEW_BASE" "$OLD_BASE" all-teams; then
     git -C src rebase --abort
     echo "the patch conflicts with $UPSTREAM_BRANCH: nothing changed, resolve it by hand" >&2
     exit 1
 fi
 
 undo_hint() {
-    echo "update failed, dist/ is untouched. To undo: git -C src reset --hard pre-update, then npm ci in src/webapp" >&2
+    echo "update failed, dist/ is untouched. To undo: git -C src reset --hard pre-update (and git -C src branch -f public pre-update-public), then npm ci in src/webapp" >&2
 }
 trap undo_hint ERR
 

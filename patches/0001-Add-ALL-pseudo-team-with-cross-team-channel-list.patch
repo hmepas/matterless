@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 3 Nov 2026 11:12:20 +0300
-Subject: [PATCH 01/11] Add ALL pseudo-team with cross-team channel list
+Subject: [PATCH 01/14] Add ALL pseudo-team with cross-team channel list
 
 A tile in the team sidebar switches the channel sidebar to one list of
 channels from every team plus DMs and GMs, with a mini team icon on each

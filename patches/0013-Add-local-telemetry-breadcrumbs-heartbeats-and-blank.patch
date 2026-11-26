@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 24 Nov 2026 20:37:32 +0300
-Subject: [PATCH] Add local telemetry, breadcrumbs, heartbeats, and
+Subject: [PATCH 13/14] Add local telemetry, breadcrumbs, heartbeats, and
  blank-screen watchdog
 
 Embed lightweight client diagnostics that send sanitized stack traces, React component stacks, last 40 breadcrumbs (routes, network/focus, WebSocket transitions, failed/slow fetches), periodic heartbeats, manual Cmd/Ctrl+Shift+Alt+D snapshots, and automatic blank-screen watchdog reports to the local proxy POST /__telemetry endpoint.

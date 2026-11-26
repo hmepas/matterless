@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 3 Nov 2026 11:32:11 +0300
-Subject: [PATCH 03/11] Keep the selected channel in view in ALL mode
+Subject: [PATCH 03/14] Keep the selected channel in view in ALL mode
 
 A click on a channel from another team changes the team, and upstream scrolls
 the sidebar to the top on that, so the list jumped back to its start. ALL mode

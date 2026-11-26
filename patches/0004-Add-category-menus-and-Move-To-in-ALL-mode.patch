@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 3 Nov 2026 13:20:24 +0300
-Subject: [PATCH 04/11] Add category menus and Move To in ALL mode
+Subject: [PATCH 04/14] Add category menus and Move To in ALL mode
 
 Each ALL category gets the native three-dots menu: mark as read, mute, rename,
 delete, and sorting with two new options, unread on top and group by team.

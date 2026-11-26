@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 3 Nov 2026 11:12:20 +0300
-Subject: [PATCH 02/11] Let the dev server front a remote Mattermost server
+Subject: [PATCH 02/14] Let the dev server front a remote Mattermost server
 
 Proxies to a remote https server, rewrites SiteURL so the desktop app keeps
 localhost, injects session cookies from env, stores the ALL layout in a file,

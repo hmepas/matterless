@@ -52,6 +52,7 @@ git -C src remote add origin https://github.com/mattermost/mattermost.git
 git -C src fetch --depth 1 --filter=blob:none origin "$BASE"
 git -C src checkout -b all-teams FETCH_HEAD
 git -C src am ../patches/*.patch
+git -C src branch public
 ```
 
 Install webapp dependencies and build `dist/`:
@@ -117,7 +118,7 @@ All runtime settings can go in `session.env` or in the process environment.
 
 ## Updating Mattermost
 
-`update.sh` fetches the latest commit of `UPSTREAM_BRANCH`, rebases `all-teams` onto it, runs `npm ci`, type-checks with `tsc`, runs the patch tests, updates `patches/BASE`, and rebuilds `dist/`:
+`update.sh` fetches the latest commit of `UPSTREAM_BRANCH`, rebases `public` and then the private commits in `all-teams` onto it, runs `npm ci`, type-checks with `tsc`, runs the patch tests, updates `patches/BASE`, and rebuilds `dist/`:
 
 ```bash
 ./update.sh
@@ -142,9 +143,10 @@ Run webapp tests through `test.sh`, never plain `npx jest`. Plain Jest spawns a 
 ## Repo map
 
 - `proxy.mjs` and `proxy.test.mjs`: standalone HTTP and WebSocket proxy with black-box tests.
-- `patches/`: numbered `git format-patch` series plus `patches/BASE`.
+- `patches/`: numbered `git format-patch` series plus `patches/BASE`, exported from `src` branch `public`.
+- `patches.local/` (ignored): private patches for one specific server, exported from `public..all-teams`.
 - `build.sh`: builds `src/webapp/channels`, swaps `dist/`, and re-exports `patches/*.patch`.
 - `run.sh`: loads `session.env` and starts `proxy.mjs`.
 - `update.sh`: rebases `src/` onto upstream, verifies, and rebuilds.
 - `test.sh`: memory-capped Jest wrapper running with `--maxWorkers=2` and `1G` idle worker limit.
-- Ignored local runtime files: `src/`, `dist/`, `dist.prev/`, `session.env`, `session.json`, `all-teams-layout.json`, `proxy.log`, `telemetry.jsonl`.
+- Ignored local runtime files: `src/`, `patches.local/`, `dist/`, `dist.prev/`, `session.env`, `session.json`, `all-teams-layout.json`, `proxy.log`, `telemetry.jsonl`.

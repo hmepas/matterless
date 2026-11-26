@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 24 Nov 2026 11:33:30 +0300
-Subject: [PATCH 10/11] Add proxy SSO desktop-token login to the login screen
+Subject: [PATCH 10/14] Add proxy SSO desktop-token login to the login screen
 
 When running behind the local proxy (ProxyUpstreamSiteURL set), show a button to open SSO on the real server with a desktop_token and an input to paste the resulting /login/desktop?server_token=... URL so the proxy can authenticate independently without keeping a second server configured in the desktop app.
 ---

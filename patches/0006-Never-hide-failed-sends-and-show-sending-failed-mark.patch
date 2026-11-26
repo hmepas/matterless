@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 24 Nov 2026 16:41:19 +0300
-Subject: [PATCH 06/11] Never hide failed sends and show sending/failed marks
+Subject: [PATCH 06/14] Never hide failed sends and show sending/failed marks
 
 Keep failed posts visible on errors where upstream silently removed them,
 report send failures to /__client_log, and show a pending or failed status

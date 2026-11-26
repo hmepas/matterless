@@ -18,10 +18,11 @@ Read [README.md](./README.md) first for the project overview, features, architec
 | `proxy.mjs` | yes | Local HTTP and WebSocket proxy, Node stdlib only |
 | `proxy.test.mjs` | yes | Black-box tests spawning real `proxy.mjs` against a fake upstream |
 | `patches/BASE` | yes | Upstream Mattermost commit SHA the patches sit on |
-| `patches/0001..*.patch` | yes | Numbered `git format-patch --zero-commit --no-signature` series |
+| `patches/0001..*.patch` | yes | Numbered `git format-patch --zero-commit --no-signature` series, exported from `src` branch `public` |
+| `patches.local/` | no | Private patches for one specific server, exported from `public..all-teams` |
 | `run.sh`, `build.sh`, `update.sh`, `test.sh` | yes | Operational scripts |
 | `session.env.example` | yes | Safe config template |
-| `src/` | no | Local Mattermost checkout on branch `all-teams` |
+| `src/` | no | Local Mattermost checkout: branch `public` (shareable patches) and `all-teams` (`public` + private patches) |
 | `dist/`, `dist.prev/` | no | Live production bundle and previous bundle for old hashed chunks |
 
 ## Bootstrapping a fresh workspace
@@ -35,7 +36,10 @@ git -C src remote add origin https://github.com/mattermost/mattermost.git
 git -C src fetch --depth 1 --filter=blob:none origin "$BASE"
 git -C src checkout -b all-teams FETCH_HEAD
 git -C src am ../patches/*.patch
+git -C src branch public
 ```
+
+If you keep private patches in `patches.local/`, apply them on `all-teams` after that: `git -C src am ../patches.local/*.patch`.
 
 Then install webapp dependencies using the Node version from `src/.nvmrc`:
 
@@ -47,9 +51,12 @@ To produce `dist/` for the first time, run `./build.sh` from the repo root.
 
 ## Adding or editing a webapp feature
 
-All webapp source edits live in `src/` on branch `all-teams` and are persisted back to this repo as `patches/*.patch`.
+All webapp source edits live in `src/` and are persisted back to this repo as patches. `src/` has two layers:
 
-1. **Check `src/` state first.** Confirm `git -C src branch --show-current` is `all-teams` and `git -C src status --short` is clean.
+- Branch `public`: `patches/BASE` plus everything shareable. Exported to the tracked `patches/`. This is the blueprint anyone can build from, so it must not contain anything specific to one company's server: no hostnames, no fork-only APIs or config flags, no features ported from a private server build.
+- Branch `all-teams`: `public` plus private commits on top. This is what `dist/` is built from. The private commits are exported to the gitignored `patches.local/`.
+
+1. **Check `src/` state first.** Confirm `git -C src status --short` is clean and `git -C src merge-base --is-ancestor public all-teams` succeeds. Decide which layer the change belongs to; if it touches both, split it into two commits.
 2. **Keep patches modular and marked.** Add a brief `// PATCH(<topic>): ...` comment when modifying upstream files so future rebases in `update.sh` stay easy to resolve. Avoid editing unrelated upstream code.
 3. **Follow Mattermost `release-10.10` constraints.** This branch uses React 17, `react-beautiful-dnd`, `react-custom-scrollbars`, and the local `utils/use_external_store.ts` shim instead of React 18's `useSyncExternalStore`. Keep new code compatible with `src/webapp/channels/tsconfig.json`.
 4. **Write focused tests next to your changes.** Add or update Jest tests covering the feature and edge cases.
@@ -59,13 +66,15 @@ All webapp source edits live in `src/` on branch `all-teams` and are persisted b
    ./test.sh src/path/to/your_test.tsx
    ```
 6. **Commit inside `src/` as one logical commit.** Give the commit a clear subject and body explaining why the change exists. That commit message becomes the patch file name and header.
-7. **Build and export patches.** Run `./build.sh`. It builds `dist/` atomically, keeps `dist.prev/` for open tabs, and regenerates `patches/*.patch` from `$(cat patches/BASE)..all-teams`.
+   - Public change: save the old tip with `git -C src branch -f public-prev public`, commit on `public` (or cherry-pick onto it), then move the private layer on top with `git -C src rebase --onto public public-prev all-teams`.
+   - Private change: commit on `all-teams` only.
+7. **Build and export patches.** Run `./build.sh`. It builds `dist/` from `all-teams` atomically, keeps `dist.prev/` for open tabs, regenerates `patches/*.patch` from `$(cat patches/BASE)..public` and `patches.local/*.patch` from `public..all-teams`, and warns if the real server's host shows up in `patches/`.
 8. **If you do not want to rebuild `dist/` yet**, you can export patches alone with:
    ```bash
    rm -f patches/*.patch
-   git -C src format-patch -q --zero-commit --no-signature -o "$PWD/patches" "$(cat patches/BASE)..all-teams"
+   git -C src format-patch -q --zero-commit --no-signature -o "$PWD/patches" "$(cat patches/BASE)..public"
    ```
-9. **Commit in the outer repo.** Stage `patches/` plus any outer files you changed and commit.
+9. **Commit in the outer repo.** Check `git diff --stat patches/` lists only the patches you meant to change, then stage `patches/` plus any outer files you changed and commit.
 
 ## Changing the proxy
 

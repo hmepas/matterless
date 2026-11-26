@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pavel Khmelinsky <hmepas@gmail.com>
+Date: Thu, 26 Nov 2026 17:52:29 +0300
+Subject: [PATCH 14/14] Don't crash the ALL sidebar when a channel ref attaches
+ mid-commit
+
+react-custom-scrollbars sets its `container` through an inline ref callback,
+so React clears and re-sets it on every re-render. Child refs attach before
+parent refs, so when switching from a team back to ALL the current channel's
+<li> ref called revealCurrentChannel while `container` was still null, which
+threw in getBoundingClientRect and tripped the root error boundary.
+
+Skip the reveal while the container is detached; componentDidUpdate retries
+once the commit finishes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../sidebar/sidebar_list/sidebar_list.test.tsx   | 16 +++++++++++++++-
+ .../sidebar/sidebar_list/sidebar_list.tsx        | 10 +++++++---
+ 2 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.test.tsx b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.test.tsx
+index c5d8ce4d..01308e6d 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.test.tsx
++++ b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.test.tsx
+@@ -320,7 +320,7 @@ describe('SidebarList', () => {
+             instance.channelRefs.set('picked', {getBoundingClientRect: () => item} as any);
+ 
+             const select = (extra = {}) => wrapper.setProps({currentChannelId: 'picked', ...extra});
+-            return {scrollTop, scrollToTop: instance.scrollbar.current!.scrollToTop as jest.Mock, select};
++            return {instance, scrollTop, scrollToTop: instance.scrollbar.current!.scrollToTop as jest.Mock, select};
+         };
+ 
+         afterEach(() => setAllTeamsMode(false));
+@@ -358,5 +358,19 @@ describe('SidebarList', () => {
+             select({hasUnreadThreads: true});
+             expect(scrollTop).toHaveBeenCalledTimes(1);
+         });
++
++        test('a channel ref attached while the scrollbar container is detached does not crash, and reveals later', () => {
++            const {instance, scrollTop, select} = renderInAllMode({top: 600, bottom: 632});
++            const scrollbar = instance.scrollbar.current as any;
++            const container = scrollbar.container;
++            scrollbar.container = null;
++            select();
++            expect(() => instance.setChannelRef('picked', {getBoundingClientRect: () => ({top: 600, bottom: 632})} as any)).not.toThrow();
++            expect(scrollTop).not.toHaveBeenCalled();
++
++            scrollbar.container = container;
++            select({hasUnreadThreads: true});
++            expect(scrollTop).toHaveBeenCalledTimes(1);
++        });
+     });
+ });
+diff --git a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
+index 5ec3b062..ecbfe165 100644
+--- a/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
++++ b/webapp/channels/src/components/sidebar/sidebar_list/sidebar_list.tsx
+@@ -225,13 +225,17 @@ export class SidebarList extends React.PureComponent<Props, State> {
+         const channelId = this.props.currentChannelId;
+         const element = this.channelRefs.get(channelId);
+         const scrollbar = this.scrollbar.current;
+-        if (!this.state.allTeamsMode || channelId === this.revealedChannelId || !element || !scrollbar) {
++
++        // react-custom-scrollbars keeps its outer element in `container`, missing from its typings. Its
++        // inline ref callback leaves it null during a commit, when a channel's ref can already call this;
++        // componentDidUpdate retries once the commit is done.
++        const container = (scrollbar as unknown as {container: HTMLElement | null} | null)?.container;
++        if (!this.state.allTeamsMode || channelId === this.revealedChannelId || !element || !scrollbar || !container) {
+             return;
+         }
+         this.revealedChannelId = channelId;
+ 
+-        // react-custom-scrollbars keeps its outer element in `container`, missing from its typings.
+-        const box = (scrollbar as unknown as {container: HTMLElement}).container.getBoundingClientRect();
++        const box = container.getBoundingClientRect();
+         const item = element.getBoundingClientRect();
+         const hiddenAbove = (box.top + categoryHeaderHeight) - item.top;
+         const hiddenBelow = item.bottom - box.bottom;

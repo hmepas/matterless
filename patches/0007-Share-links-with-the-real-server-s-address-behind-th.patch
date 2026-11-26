@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Fri, 6 Nov 2026 12:56:55 +0300
-Subject: [PATCH 07/11] Share links with the real server's address behind the
+Subject: [PATCH 07/14] Share links with the real server's address behind the
  local proxy
 
 The proxy reports itself as SiteURL so the desktop app stays on localhost, which made copied and

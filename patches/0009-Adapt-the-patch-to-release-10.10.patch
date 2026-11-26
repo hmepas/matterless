@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 24 Nov 2026 16:41:19 +0300
-Subject: [PATCH 09/11] Adapt the patch to release-10.10
+Subject: [PATCH 09/14] Adapt the patch to release-10.10
 
 React 17 has no useSyncExternalStore, so a small hook stands in for it. The sidebar uses
 react-beautiful-dnd and react-custom-scrollbars, WithTooltip lives in components/, and tests

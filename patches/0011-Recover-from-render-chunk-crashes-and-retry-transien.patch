@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Pavel Khmelinsky <hmepas@gmail.com>
 Date: Tue, 24 Nov 2026 15:11:15 +0300
-Subject: [PATCH 11/11] Recover from render/chunk crashes and retry transient
+Subject: [PATCH 11/14] Recover from render/chunk crashes and retry transient
  permalink loads
 
 ---
